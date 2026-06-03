@@ -1,0 +1,17 @@
+# 数据和配置（敏感信息）
+vpngate_data/
+*.json
+*.ovpn
+*.log
+
+# 备份目录（不上传到 GitHub）
+backup/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统
+.DS_Store
+*.tmp

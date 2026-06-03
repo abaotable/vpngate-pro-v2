@@ -1,0 +1,2037 @@
+#!/usr/bin/env python3
+"""VPNGate Pro - 双节点智能代理网关"""
+from __future__ import annotations
+import base64, concurrent.futures, csv, hashlib, json, os, queue
+import random, re, socket, string, subprocess, threading, time
+import urllib.parse, urllib.request, uuid as _uuid_mod
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0: family = socket.AF_INET
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+socket.getaddrinfo = _ipv4_only
+
+import vpn_utils
+import proxy_server as proxy_mod
+
+API_URL   = "https://www.vpngate.net/api/iphone/"
+ROOT_DIR  = Path(__file__).resolve().parent
+DATA_DIR  = Path(os.environ.get("VPNGATE_DATA_DIR", str(ROOT_DIR / "vpngate_data")))
+CONFIG_DIR        = DATA_DIR / "configs"
+NODES_FILE        = DATA_DIR / "nodes.json"
+CUSTOM_NODES_FILE = DATA_DIR / "custom_nodes.json"
+UI_AUTH_FILE      = DATA_DIR / "ui_auth.json"
+SLOT_CONFIG_FILE  = DATA_DIR / "slot_config.json"
+XRAY_DISPATCH_FILE= DATA_DIR / "xray_dispatch.json"
+AUTH_FILE         = DATA_DIR / "vpngate_auth.txt"
+LOGS_DIR          = DATA_DIR / "logs"
+XRAY_BIN        = Path("/root/agsbx/xray")
+XRAY_CFG        = Path("/root/agsbx/xr.json")
+XRAY_LOG        = Path("/root/agsbx/xray.log")
+XRAY_CONFIG_FILE = XRAY_CFG   # 兼容旧引用
+
+def _restart_xray() -> bool:
+    """强制杀死并重启 xray 进程，返回是否成功"""
+    # 先尝试优雅退出，再强制kill
+    subprocess.run(["pkill", "-f", "xray run"], capture_output=True)
+    time.sleep(1)
+    subprocess.run(["pkill", "-9", "-f", "xray run"], capture_output=True)
+    time.sleep(1)
+    if not XRAY_BIN.exists():
+        log("ERROR", "xray", f"xray 可执行文件不存在: {XRAY_BIN}")
+        return False
+    try:
+        log_file = open(XRAY_LOG, "a")
+        proc = subprocess.Popen(
+            [str(XRAY_BIN), "run", "-c", str(XRAY_CFG)],
+            stdout=log_file, stderr=log_file,
+            start_new_session=True,
+        )
+        time.sleep(2)
+        if proc.poll() is None:
+            log("INFO", "xray", f"xray 重启成功，PID={proc.pid}")
+            return True
+        else:
+            log("ERROR", "xray", "xray 启动后立即退出")
+            return False
+    except Exception as e:
+        log("ERROR", "xray", f"xray 启动失败: {e}")
+        return False
+
+def xray_watchdog() -> None:
+    """守护线程：每30秒检查 xray 是否在运行，崩溃则自动重启"""
+    time.sleep(15)  # 启动后等15秒再开始监控
+    while True:
+        time.sleep(30)
+        result = subprocess.run(["pgrep", "-f", "xray run"],
+                                capture_output=True, text=True)
+        if not result.stdout.strip():
+            log("WARNING", "xray", "xray 进程不存在，自动重启...")
+            _restart_xray()
+
+OPENVPN_CMD       = os.environ.get("OPENVPN_CMD", "openvpn")
+MAX_SCAN_ROWS     = 300
+MAX_CONCURRENT_TESTS = 6
+OPENVPN_TIMEOUT   = 35
+
+SLOTS = [
+    {"id": 0, "tun": "tun10", "table": 110, "proxy_port": 7920},
+    {"id": 1, "tun": "tun11", "table": 111, "proxy_port": 7921},
+]
+
+lock = threading.RLock()
+
+# ── Slot状态 ─────────────────────────────────────────────────────────
+class SlotState:
+    def __init__(self, slot_id: int):
+        self.slot_id      = slot_id
+        self.process: subprocess.Popen | None = None
+        self.node_id      = ""
+        self.node_type    = ""
+        self.is_connecting= False
+        self.status_msg   = "未启动"
+        self.proxy_ok     = False
+        self.proxy_ip     = ""
+        self.latency_ms   = 0
+        self.tun_ip       = ""   # 当前 tun 本地 IP（用于策略路由清理）
+        # 主备节点状态
+        self.using_backup = False
+        self.primary_id   = ""
+        self.backup_ids: list[str] = []
+
+slot_states = {s["id"]: SlotState(s["id"]) for s in SLOTS}
+
+# ── 每槽配置 ─────────────────────────────────────────────────────────
+# node_sources: 自动切换来源优先级（无主备模式时使用）
+# primary_node_id: 主节点ID
+# backup_node_ids: 备用节点ID列表
+# recovery_interval: 主节点恢复检测间隔（分钟）
+DEFAULT_SLOT_CFG = {
+    "auto_switch":        True,
+    "node_sources":       ["vpngate_residential", "vpngate_any"],
+    "countries":          [],
+    "max_latency_ms":     0,
+    "prefer_tcp":         True,      # 优先选TCP节点
+    "primary_node_id":    "",        # 空=不设主节点，使用自动选择
+    "backup_node_ids":    [],        # 备用节点ID列表
+    "recovery_interval":  10,        # 主节点恢复检测间隔（分钟）
+}
+
+def load_slot_configs() -> dict[str, Any]:
+    data = read_json(SLOT_CONFIG_FILE, {})
+    result = {}
+    for s in SLOTS:
+        sid = str(s["id"])
+        cfg = dict(DEFAULT_SLOT_CFG)
+        cfg.update(data.get(sid, {}))
+        result[sid] = cfg
+    return result
+
+def save_slot_configs(configs: dict[str, Any]) -> None:
+    write_json(SLOT_CONFIG_FILE, configs)
+
+# ── xray出口配置 ─────────────────────────────────────────────────────
+XRAY_INBOUND_TAGS = {
+    "reality-vision": "VLESS-Reality (:25476)",
+    "vmess-xr":       "VMess-WS (:6123)",
+    "socks5-xr":      "SOCKS5 (:42447)",
+}
+DEFAULT_XRAY_DISPATCH = {tag: "direct" for tag in XRAY_INBOUND_TAGS}
+
+def load_xray_dispatch() -> dict[str, str]:
+    data = read_json(XRAY_DISPATCH_FILE, {})
+    result = dict(DEFAULT_XRAY_DISPATCH)
+    result.update(data)
+    return result
+
+def save_xray_dispatch(cfg: dict[str, str]) -> None:
+    write_json(XRAY_DISPATCH_FILE, cfg)
+
+def apply_xray_dispatch(cfg: dict[str, str]) -> None:
+    """
+    更新 xray 配置：每个 inbound tag 独立映射到对应槽端口，热重载 xray。
+    slot0 → socks5://127.0.0.1:7920
+    slot1 → socks5://127.0.0.1:7921
+    direct → freedom outbound
+    """
+    if not XRAY_CONFIG_FILE.exists():
+        log("WARNING", "xray", f"配置文件不存在: {XRAY_CONFIG_FILE}")
+        return
+    try:
+        xray_cfg = json.loads(XRAY_CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log("ERROR", "xray", f"读取配置失败: {e}")
+        return
+
+    outbounds = [o for o in xray_cfg.get("outbounds", [])
+                 if o.get("tag") not in ("vpngate-slot0", "vpngate-slot1")]
+
+    slots_used = set(v for v in cfg.values() if v != "direct")
+    if "slot0" in slots_used:
+        outbounds.append({
+            "tag": "vpngate-slot0", "protocol": "socks",
+            "settings": {"servers": [{"address": "127.0.0.1", "port": 7920}]}
+        })
+    if "slot1" in slots_used:
+        outbounds.append({
+            "tag": "vpngate-slot1", "protocol": "socks",
+            "settings": {"servers": [{"address": "127.0.0.1", "port": 7921}]}
+        })
+    xray_cfg["outbounds"] = outbounds
+
+    routing = xray_cfg.get("routing", {})
+    rules = [r for r in routing.get("rules", [])
+             if not (r.get("outboundTag", "").startswith("vpngate-slot") and r.get("inboundTag"))]
+
+    for tag, slot in cfg.items():
+        if slot == "direct":
+            continue
+        outbound_tag = f"vpngate-{slot}"
+        rules.insert(0, {
+            "type": "field",
+            "inboundTag": [tag],
+            "outboundTag": outbound_tag,
+        })
+
+    routing["rules"] = rules
+    xray_cfg["routing"] = routing
+
+    try:
+        XRAY_CFG.write_text(
+            json.dumps(xray_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log("ERROR", "xray", f"写入配置失败: {e}")
+        return
+
+    # SIGHUP 在 argosbx 环境下无效，直接强制重启
+    if _restart_xray():
+        log("INFO", "xray", "配置已应用，xray 重启成功")
+    else:
+        log("ERROR", "xray", "xray 重启失败，请手动检查")
+
+# ── 辅助函数 ─────────────────────────────────────────────────────────
+def ensure_dirs() -> None:
+    DATA_DIR.mkdir(exist_ok=True, parents=True)
+    CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+    LOGS_DIR.mkdir(exist_ok=True, parents=True)
+    if not AUTH_FILE.exists():
+        AUTH_FILE.write_text("vpn\nvpn\n")
+        AUTH_FILE.chmod(0o600)
+
+def write_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+def safe_name(v: str) -> str:
+    v = re.sub(r"[^A-Za-z0-9_.-]+", "_", v.strip())
+    return v.strip("._") or "node"
+
+def parse_int(v: Any) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+def log(level: str, module: str, msg: str) -> None:
+    entry = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+             "level": level, "module": module, "message": msg}
+    try:
+        lf = LOGS_DIR / f"{time.strftime('%Y-%m-%d')}.json"
+        with open(lf, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    print(f"[{level}][{module}] {msg}", flush=True)
+
+# ── UI认证 ───────────────────────────────────────────────────────────
+def _rand_str(n: int, alpha_start: bool = False) -> str:
+    chars = string.ascii_letters + string.digits
+    while True:
+        s = "".join(random.choices(chars, k=n))
+        if any(c.islower() for c in s) and any(c.isupper() for c in s) and any(c.isdigit() for c in s):
+            if not alpha_start or s[0].isalpha():
+                return s
+
+def load_ui_config() -> dict[str, Any]:
+    cfg: dict[str, Any] = {"username": "", "password": "", "host": "0.0.0.0", "port": 8787}
+    if UI_AUTH_FILE.exists():
+        try:
+            cfg.update(json.loads(UI_AUTH_FILE.read_text()))
+        except Exception:
+            pass
+    changed = False
+    if not cfg.get("username"):
+        cfg["username"] = _rand_str(12, alpha_start=True); changed = True
+    if not cfg.get("password"):
+        cfg["password"] = _rand_str(12); changed = True
+    if changed:
+        UI_AUTH_FILE.write_text(json.dumps(cfg, indent=2))
+    return cfg
+
+def save_ui_config(cfg: dict[str, Any]) -> None:
+    UI_AUTH_FILE.write_text(json.dumps(cfg, indent=2))
+
+def session_token(username: str, password: str) -> str:
+    return hashlib.sha256(f"{username}:{password}:vpngate-pro-2026".encode()).hexdigest()
+
+WEB_SESSIONS: dict[str, float] = {}
+SESSION_TTL = 7200
+
+# ── 节点拉取 ─────────────────────────────────────────────────────────
+def fetch_candidates() -> list[dict[str, Any]]:
+    log("INFO", "Fetch", "开始拉取 VPNGate 节点列表...")
+    req = urllib.request.Request(API_URL,
+        headers={"User-Agent": "Mozilla/5.0 vpngate-pro/1.0", "Accept": "text/plain,*/*"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+    lines = [l for l in text.splitlines() if l and not l.startswith("*")]
+    if lines and lines[0].startswith("#"):
+        lines[0] = lines[0][1:]
+    rows = list(csv.DictReader(lines))
+    candidates: list[dict[str, Any]] = []
+    seen_ips: set[str] = set()
+    for row in rows[:MAX_SCAN_ROWS]:
+        ip = row.get("IP", "").strip()
+        if not ip or ip in seen_ips:
+            continue
+        encoded = row.get("OpenVPN_ConfigData_Base64", "").strip()
+        if not encoded:
+            continue
+        try:
+            config_text = base64.b64decode(encoded.encode(), validate=False).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        country_long  = row.get("CountryLong", "")
+        country_short = row.get("CountryShort", "")
+        country_zh    = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long)
+        remote_host, remote_port, proto = vpn_utils.parse_remote(config_text, ip)
+        node_id = safe_name("_".join([country_short or "XX", ip, str(remote_port), proto]))
+        config_path = CONFIG_DIR / f"{node_id}.ovpn"
+        candidates.append({
+            "id": node_id, "node_type": "vpngate",
+            "country": country_zh, "country_short": country_short, "country_zh": country_zh,
+            "host_name": row.get("HostName", ""), "ip": ip,
+            "score": parse_int(row.get("Score")), "ping": parse_int(row.get("Ping")),
+            "speed": parse_int(row.get("Speed")),
+            "config_file": str(config_path), "config_text": config_text,
+            "proto": proto, "remote_host": remote_host, "remote_port": remote_port,
+            "fetched_at": time.time(), "probe_status": "not_checked",
+            "probe_message": "", "probed_at": 0, "latency_ms": 0,
+            "owner": "", "asn": "", "as_name": "", "location": "",
+            "ip_type": "unknown", "quality": "未知", "active_slot": -1,
+        })
+        seen_ips.add(ip)
+    log("INFO", "Fetch", f"获取到 {len(candidates)} 个候选节点")
+    return candidates
+
+def sort_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(n):
+        proto_score = 0 if n.get("proto", "tcp") == "tcp" else 1
+        lat = parse_int(n.get("latency_ms")) or 999999
+        return (0 if n.get("probe_status") == "available" else
+                1 if n.get("probe_status") == "not_checked" else 2,
+                proto_score, lat, -parse_int(n.get("score")))
+    return sorted(nodes, key=key)
+
+# ── OpenVPN ──────────────────────────────────────────────────────────
+_openvpn_ver: float | None = None
+
+def get_openvpn_version() -> float:
+    global _openvpn_ver
+    if _openvpn_ver is not None:
+        return _openvpn_ver
+    try:
+        res = subprocess.run([OPENVPN_CMD, "--version"], capture_output=True, text=True, timeout=3)
+        m = re.search(r"OpenVPN\s+(\d+\.\d+)", res.stdout + res.stderr)
+        if m:
+            _openvpn_ver = float(m.group(1)); return _openvpn_ver
+    except Exception:
+        pass
+    _openvpn_ver = 2.4; return _openvpn_ver
+
+def build_openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
+    cmd = [OPENVPN_CMD, "--config", config_file,
+           "--dev", tun_dev, "--dev-type", "tun",
+           "--pull-filter", "ignore", "route-ipv6",
+           "--pull-filter", "ignore", "ifconfig-ipv6",
+           "--route-delay", "2", "--connect-retry-max", "1",
+           "--connect-timeout", "15",
+           "--auth-user-pass", str(AUTH_FILE), "--auth-nocache",
+           "--route-nopull"]
+    ver = get_openvpn_version()
+    if ver >= 2.5:
+        cmd += ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"]
+    else:
+        cmd += ["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"]
+    cmd += ["--verb", "3"]
+    return cmd
+
+def run_openvpn(config_file: str, tun_dev: str, keep_alive: bool,
+                timeout: int = OPENVPN_TIMEOUT) -> tuple[bool, str, subprocess.Popen | None]:
+    try:
+        proc = subprocess.Popen(build_openvpn_cmd(config_file, tun_dev),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", cwd=str(ROOT_DIR))
+    except FileNotFoundError:
+        return False, "openvpn 命令未找到", None
+    except OSError as e:
+        return False, f"openvpn 启动失败: {e}", None
+
+    lines: queue.Queue[str | None] = queue.Queue()
+    done = [False]
+
+    def reader():
+        assert proc.stdout
+        for line in proc.stdout:
+            if not done[0]: lines.put(line.rstrip())
+        if not done[0]: lines.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    started = time.time()
+    ok = False
+    msg = "OpenVPN 初始化超时"
+
+    while time.time() - started < timeout:
+        try:
+            line = lines.get(timeout=0.5)
+        except queue.Empty:
+            if proc.poll() is not None: break
+            continue
+        if line is None: break
+        if line:
+            if keep_alive:
+                print(f"[OpenVPN/{tun_dev}] {line}", flush=True)
+            lower = line.lower()
+            if "initialization sequence completed" in lower:
+                ok = True
+                msg = f"连接成功，耗时 {int((time.time()-started)*1000)} ms"
+                break
+            if "auth_failed" in lower or "authentication failed" in lower:
+                msg = "AUTH_FAILED"; break
+            if "fatal error" in lower:
+                msg = line[-200:]; break
+    else:
+        msg = f"连接超时 ({timeout}s)"
+
+    done[0] = True
+    if not ok or not keep_alive:
+        _stop_proc(proc); proc = None
+    return ok, msg, proc
+
+def _stop_proc(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None: return
+    proc.terminate()
+    try: proc.wait(timeout=8)
+    except subprocess.TimeoutExpired: proc.kill()
+
+def get_tun_local_ip(tun_dev: str) -> str:
+    try:
+        result = subprocess.run(["ip", "addr", "show", tun_dev],
+                                capture_output=True, text=True, timeout=3)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", result.stdout)
+        if m: return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+def setup_policy_routing(tun_dev: str, table_id: int, tun_ip: str) -> None:
+    """
+    配置策略路由：源IP为 tun_ip 的流量走 tun_dev。
+    microsocks 绑定 tun_ip 作为源地址，内核自动路由到 tun 接口。
+    """
+    # 清理旧规则
+    subprocess.run(["ip", "rule", "del", "from", tun_ip, "table", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "rule", "del", "fwmark", str(table_id), "table", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "route", "flush", "table", str(table_id)], capture_output=True)
+    for _ in range(3):
+        try:
+            subprocess.run(["ip", "route", "add", "default", "dev", tun_dev,
+                            "table", str(table_id)], check=True, timeout=3)
+            subprocess.run(["ip", "rule", "add", "from", tun_ip,
+                            "table", str(table_id)], check=True, timeout=3)
+            log("INFO", "Routing", f"策略路由: from {tun_ip} → {tun_dev} → 表{table_id}")
+            return
+        except Exception as e:
+            log("WARNING", "Routing", f"策略路由设置失败: {e}")
+            time.sleep(1)
+
+def cleanup_policy_routing(table_id: int, tun_ip: str = "") -> None:
+    if tun_ip:
+        subprocess.run(["ip", "rule", "del", "from", tun_ip, "table", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "rule", "del", "fwmark", str(table_id), "table", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "rule", "del", "table", str(table_id)], capture_output=True)
+    subprocess.run(["ip", "route", "flush", "table", str(table_id)], capture_output=True)
+
+def kill_slot_openvpn(tun_dev: str) -> None:
+    subprocess.run(["pkill", "-f", f"openvpn.*{tun_dev}"], capture_output=True)
+
+# ── 节点测试 ─────────────────────────────────────────────────────────
+_test_tuns: set[int] = set()
+_test_tuns_lock = threading.Lock()
+
+def _alloc_test_tun() -> int:
+    with _test_tuns_lock:
+        for i in range(2, 10):
+            if i not in _test_tuns:
+                _test_tuns.add(i); return i
+        return 9
+
+def _free_test_tun(idx: int) -> None:
+    with _test_tuns_lock:
+        _test_tuns.discard(idx)
+
+def test_node_sync(node: dict[str, Any]) -> dict[str, Any]:
+    config_path = Path(node["config_file"])
+    CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+    config_path.write_text(node.get("config_text", ""), encoding="utf-8")
+    proto = node.get("proto", "tcp")
+    latency = vpn_utils.ping_latency_ms(
+        node.get("remote_host") or node.get("ip"),
+        parse_int(node.get("remote_port")),
+        proto=proto,
+        fallback=parse_int(node.get("ping")),
+    )
+    tun_idx = _alloc_test_tun()
+    # UDP节点使用更长超时
+    timeout = 20 if proto == "udp" else 12
+    try:
+        ok, msg, _ = run_openvpn(str(config_path), f"tun{tun_idx}",
+                                  keep_alive=False, timeout=timeout)
+    finally:
+        _free_test_tun(tun_idx)
+    try:
+        config_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    updates: dict[str, Any] = {
+        "latency_ms": latency, "proto": proto,
+        "probe_status": "available" if ok else "unavailable",
+        "probe_message": msg, "probed_at": time.time(),
+    }
+    if ok:
+        tmp = {"ip": node.get("ip"), "remote_host": node.get("remote_host"),
+               "owner": "", "asn": "", "as_name": "", "location": "",
+               "country_zh": "", "ip_type": "unknown", "quality": "未知"}
+        vpn_utils.enrich_ip_info([tmp])
+        for k in ("owner","asn","as_name","location","country_zh","ip_type","quality"):
+            updates[k] = tmp[k]
+    return updates
+
+def batch_test_nodes(node_ids: list[str]) -> None:
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        to_test = [n for n in nodes if n["id"] in node_ids]
+
+    def worker(node):
+        return node["id"], test_node_sync(node)
+
+    results: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TESTS) as ex:
+        futs = {ex.submit(worker, n): n["id"] for n in to_test}
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                nid, updates = fut.result()
+                results[nid] = updates
+            except Exception as e:
+                results[futs[fut]] = {"probe_status": "unavailable", "probe_message": str(e)}
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        for n in nodes:
+            if n["id"] in results:
+                n.update(results[n["id"]])
+        write_json(NODES_FILE, sort_nodes(nodes))
+
+# ── 连接/断开 ─────────────────────────────────────────────────────────
+def stop_slot(slot_id: int) -> None:
+    slot_cfg = SLOTS[slot_id]
+    st = slot_states[slot_id]
+    cleanup_policy_routing(slot_cfg["table"], st.tun_ip)
+    _stop_proc(st.process)
+    kill_slot_openvpn(slot_cfg["tun"])
+    # 停止代理（microsocks 或 Python）
+    srv = proxy_mod._proxy_slots.get(slot_id)
+    if srv: srv.stop()
+    st.process = None; st.node_id = ""; st.node_type = ""
+    st.proxy_ok = False; st.proxy_ip = ""; st.latency_ms = 0
+    st.tun_ip = ""; st.status_msg = "已断开"; st.using_backup = False
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        for n in nodes:
+            if n.get("active_slot") == slot_id: n["active_slot"] = -1
+        write_json(NODES_FILE, nodes)
+
+def connect_slot(slot_id: int, node_id: str) -> str:
+    slot_cfg = SLOTS[slot_id]
+    st = slot_states[slot_id]
+    if st.is_connecting: return "正在连接中，请稍候"
+    st.is_connecting = True
+    st.status_msg = "初始化..."
+    try:
+        with lock:
+            nodes = read_json(NODES_FILE, [])
+            node = next((n for n in nodes if n["id"] == node_id), None)
+        if not node: raise ValueError(f"节点不存在: {node_id}")
+        stop_slot(slot_id)
+        config_path = Path(node["config_file"])
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        config_path.write_text(node.get("config_text", ""), encoding="utf-8")
+        st.status_msg = "启动 OpenVPN..."
+        ok, msg, proc = run_openvpn(str(config_path), slot_cfg["tun"], keep_alive=True)
+        if not ok or proc is None:
+            try: config_path.unlink(missing_ok=True)
+            except Exception: pass
+            raise RuntimeError(f"OpenVPN 连接失败: {msg}")
+        st.process = proc; st.node_id = node_id; st.node_type = "vpngate"
+        st.status_msg = "配置路由..."
+        # 等待 tun IP 分配（最多5秒）
+        tun_ip = ""
+        for _ in range(10):
+            tun_ip = get_tun_local_ip(slot_cfg["tun"])
+            if tun_ip: break
+            time.sleep(0.5)
+        st.tun_ip = tun_ip
+        setup_policy_routing(slot_cfg["tun"], slot_cfg["table"], tun_ip)
+        # 启动 microsocks（绑定 tun_ip，流量自动经 tun 出站）
+        srv = proxy_mod._proxy_slots.get(slot_id)
+        if srv: srv.start_vpngate(tun_ip)
+        proto = node.get("proto", "tcp")
+        try:
+            lat = vpn_utils.ping_latency_ms(
+                node.get("ip") or node.get("remote_host"),
+                parse_int(node.get("remote_port")), proto=proto,
+                fallback=parse_int(node.get("ping")))
+            st.latency_ms = lat
+        except Exception:
+            pass
+        with lock:
+            nodes = read_json(NODES_FILE, [])
+            for n in nodes:
+                if n["id"] == node_id: n["active_slot"] = slot_id
+                elif n.get("active_slot") == slot_id: n["active_slot"] = -1
+            write_json(NODES_FILE, nodes)
+        st.status_msg = "检测出口..."
+        res = check_slot_proxy(slot_id)
+        st.proxy_ok = res["ok"]
+        st.proxy_ip = res.get("ip", "")
+        st.status_msg = f"已连接 | {st.proxy_ip}" if st.proxy_ok else "已连接 | 出口检测失败"
+        log("INFO", f"Slot{slot_id}", f"节点 {node_id} 连接成功，出口: {st.proxy_ip}")
+        return f"连接成功: {node_id}"
+    except Exception as e:
+        st.status_msg = f"连接失败: {e}"
+        log("ERROR", f"Slot{slot_id}", str(e))
+        stop_slot(slot_id)
+        raise
+    finally:
+        st.is_connecting = False
+
+def connect_custom_socks5(slot_id: int, node: dict) -> str:
+    st = slot_states[slot_id]
+    if st.is_connecting: return "正在连接中，请稍候"
+    st.is_connecting = True
+    st.status_msg = "连接自建节点..."
+    try:
+        stop_slot(slot_id)
+        host = node["host"]; port = int(node["port"])
+        lat = vpn_utils.ping_latency_ms(host, port)
+        if lat == 0: raise RuntimeError(f"无法连接到 {host}:{port}")
+        st.latency_ms = lat
+        srv = proxy_mod._proxy_slots.get(slot_id)
+        if srv:
+            srv.set_upstream_socks5({
+                "host": host, "port": port,
+                "username": node.get("username", ""),
+                "password": node.get("password", ""),
+            })
+        st.node_id = node["id"]; st.node_type = "custom"
+        res = check_slot_proxy(slot_id)
+        st.proxy_ok = res["ok"]; st.proxy_ip = res.get("ip", "")
+        st.status_msg = f"已连接 | {st.proxy_ip}" if st.proxy_ok else "已连接 | 出口检测失败"
+        log("INFO", f"Slot{slot_id}", f"自建节点 {node['name']} 连接成功，出口: {st.proxy_ip}")
+        return f"连接成功: {node['name']}"
+    except Exception as e:
+        st.status_msg = f"连接失败: {e}"
+        log("ERROR", f"Slot{slot_id}", str(e))
+        stop_slot(slot_id)
+        raise
+    finally:
+        st.is_connecting = False
+
+def check_slot_proxy(slot_id: int) -> dict[str, Any]:
+    proxy_port = SLOTS[slot_id]["proxy_port"]
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({
+                "http":  f"http://127.0.0.1:{proxy_port}",
+                "https": f"http://127.0.0.1:{proxy_port}",
+            }))
+        t0 = time.time()
+        with opener.open("http://208.95.112.1/json/?fields=query,country,org", timeout=12) as resp:
+            data = json.loads(resp.read())
+        return {"ok": True, "ip": data.get("query", ""),
+                "latency_ms": int((time.time()-t0)*1000)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ── 自动切换（主备节点逻辑） ──────────────────────────────────────────
+def _get_node_by_id(node_id: str) -> dict | None:
+    nodes = read_json(NODES_FILE, [])
+    return next((n for n in nodes if n["id"] == node_id), None)
+
+def _try_connect_node(slot_id: int, node_id: str) -> bool:
+    """尝试连接节点，返回是否成功且出口可达"""
+    try:
+        connect_slot(slot_id, node_id)
+        return slot_states[slot_id].proxy_ok
+    except Exception:
+        return False
+
+def auto_switch_slot(slot_id: int) -> None:
+    """
+    自动切换逻辑：
+    1. 有主节点配置时：尝试主节点 → 依次尝试备用节点
+    2. 无主节点配置时：从 node_sources 过滤可用节点自动选择
+    """
+    st = slot_states[slot_id]
+    slot_cfgs = load_slot_configs()
+    slot_cfg = slot_cfgs.get(str(slot_id), dict(DEFAULT_SLOT_CFG))
+
+    primary_id  = slot_cfg.get("primary_node_id", "")
+    backup_ids  = slot_cfg.get("backup_node_ids", [])
+    prefer_tcp  = slot_cfg.get("prefer_tcp", True)
+
+    # ── 有主节点配置 ──
+    if primary_id:
+        # 先尝试主节点
+        log("INFO", f"Slot{slot_id}", f"尝试主节点: {primary_id}")
+        if _try_connect_node(slot_id, primary_id):
+            st.using_backup = False
+            st.primary_id = primary_id
+            st.backup_ids = backup_ids
+            log("INFO", f"Slot{slot_id}", "主节点连接成功")
+            return
+        # 主节点失败，依次尝试备用节点
+        for bid in backup_ids:
+            log("INFO", f"Slot{slot_id}", f"主节点失败，尝试备用: {bid}")
+            if _try_connect_node(slot_id, bid):
+                st.using_backup = True
+                st.primary_id = primary_id
+                st.backup_ids = backup_ids
+                log("INFO", f"Slot{slot_id}", f"备用节点 {bid} 连接成功")
+                return
+        log("ERROR", f"Slot{slot_id}", "主节点和所有备用节点均失败")
+        stop_slot(slot_id)
+        return
+
+    # ── 无主节点，自动从 node_sources 选择 ──
+    other_node = slot_states[1 - slot_id].node_id
+    sources = slot_cfg.get("node_sources", ["vpngate_any"])
+    countries = slot_cfg.get("countries", [])
+    max_lat = slot_cfg.get("max_latency_ms", 0)
+    vpngate_nodes = read_json(NODES_FILE, [])
+
+    candidates = []
+    for src in sources:
+        cands = [n for n in vpngate_nodes
+                 if n.get("probe_status") == "available"
+                 and n["id"] != other_node]
+        if src == "vpngate_residential":
+            cands = [n for n in cands if n.get("ip_type") == "residential"]
+        elif src == "vpngate_datacenter":
+            cands = [n for n in cands if n.get("ip_type") == "datacenter"]
+        if countries:
+            cands = [n for n in cands if n.get("country_short", "") in countries]
+        if max_lat > 0:
+            cands = [n for n in cands if parse_int(n.get("latency_ms", 0)) <= max_lat]
+        if prefer_tcp:
+            tcp_cands = [n for n in cands if n.get("proto", "tcp") == "tcp"]
+            cands = tcp_cands if tcp_cands else cands
+        cands.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999,
+                                  -parse_int(n.get("score"))))
+        if cands:
+            candidates = cands; break
+
+    if not candidates:
+        log("ERROR", f"Slot{slot_id}", "没有可用节点")
+        stop_slot(slot_id); return
+
+    target = candidates[0]
+    log("INFO", f"Slot{slot_id}", f"自动切换 → {target['id']}")
+    try:
+        connect_slot(slot_id, target["id"])
+    except Exception as e:
+        log("ERROR", f"Slot{slot_id}", f"自动切换失败: {e}")
+
+# ── 健康监控 ──────────────────────────────────────────────────────────
+def _verify_slot_tunnel(slot_id: int) -> bool:
+    proxy_port = SLOTS[slot_id]["proxy_port"]
+    for url in ["http://connectivitycheck.gstatic.com/generate_204",
+                "http://208.95.112.1/json/?fields=query"]:
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{proxy_port}"}))
+            with opener.open(url, timeout=10) as r:
+                if r.status in (200, 204): return True
+        except Exception:
+            pass
+    return False
+
+def health_monitor() -> None:
+    fail_counts = {0: 0, 1: 0}
+    FAIL_THRESHOLD = 2
+    # 主节点恢复检测：记录上次检测时间
+    last_recovery_check = {0: 0.0, 1: 0.0}
+
+    while True:
+        time.sleep(30)
+        for slot_id in range(2):
+            st = slot_states[slot_id]
+            if not st.node_id or st.is_connecting:
+                fail_counts[slot_id] = 0
+                continue
+
+            failed = False
+            if st.node_type == "vpngate":
+                if st.process is None or st.process.poll() is not None:
+                    log("WARNING", f"Slot{slot_id}", "OpenVPN 进程已退出")
+                    failed = True
+            if not failed:
+                if not _verify_slot_tunnel(slot_id):
+                    log("WARNING", f"Slot{slot_id}", "隧道连通性检测失败")
+                    failed = True
+                else:
+                    st.proxy_ok = True
+                    fail_counts[slot_id] = 0
+
+            if failed:
+                fail_counts[slot_id] += 1
+                if fail_counts[slot_id] >= FAIL_THRESHOLD:
+                    log("WARNING", f"Slot{slot_id}",
+                        f"连续 {fail_counts[slot_id]} 次检测失败，触发自动切换")
+                    fail_counts[slot_id] = 0
+                    st.proxy_ok = False
+                    st.status_msg = "连接断开，切换中..."
+                    threading.Thread(target=auto_switch_slot, args=(slot_id,), daemon=True).start()
+                continue
+
+            # ── 主节点恢复检测 ──
+            if not st.using_backup:
+                continue
+            slot_cfgs = load_slot_configs()
+            slot_cfg = slot_cfgs.get(str(slot_id), {})
+            recovery_interval = slot_cfg.get("recovery_interval", 10) * 60
+            now = time.time()
+            if now - last_recovery_check[slot_id] < recovery_interval:
+                continue
+            last_recovery_check[slot_id] = now
+            primary_id = slot_cfg.get("primary_node_id", "")
+            if not primary_id:
+                continue
+            log("INFO", f"Slot{slot_id}", f"检测主节点是否恢复: {primary_id}")
+            # 在后台测试主节点
+            def _check_primary(sid=slot_id, pid=primary_id):
+                updates = test_node_sync(_get_node_by_id(pid) or {"id": pid})
+                if updates.get("probe_status") == "available":
+                    log("INFO", f"Slot{sid}", f"主节点 {pid} 已恢复，切换回主节点")
+                    try:
+                        connect_slot(sid, pid)
+                        slot_states[sid].using_backup = False
+                    except Exception as e:
+                        log("ERROR", f"Slot{sid}", f"切换回主节点失败: {e}")
+            threading.Thread(target=_check_primary, daemon=True).start()
+
+def refresh_nodes_loop() -> None:
+    while True:
+        time.sleep(960)
+        try:
+            candidates = fetch_candidates()
+            with lock:
+                existing = {n["id"]: n for n in read_json(NODES_FILE, [])}
+            merged, seen = [], set()
+            for c in candidates:
+                if c["id"] in existing:
+                    ex = existing[c["id"]]
+                    ex["config_text"] = c["config_text"]
+                    ex["fetched_at"]  = c["fetched_at"]
+                    merged.append(ex)
+                else:
+                    merged.append(c)
+                seen.add(c["id"])
+            for nid, n in existing.items():
+                if nid not in seen: merged.append(n)
+            write_json(NODES_FILE, sort_nodes(merged[:1000]))
+            log("INFO", "Refresh", f"节点刷新完成，共 {len(merged)} 个")
+        except Exception as e:
+            log("ERROR", "Refresh", str(e))
+
+# ── Web UI HTML ──────────────────────────────────────────────────────
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPNGate Pro</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+.nav{background:#1a1d27;border-bottom:1px solid #2d3748;padding:12px 24px;display:flex;align-items:center;gap:16px}
+.nav h1{font-size:18px;font-weight:700;color:#63b3ed}
+.badge{background:#2d3748;border-radius:6px;padding:3px 10px;font-size:12px;color:#a0aec0}
+.tabs{display:flex;gap:2px;padding:0 24px;background:#1a1d27;border-bottom:1px solid #2d3748;overflow-x:auto}
+.tab{padding:10px 16px;cursor:pointer;font-size:13px;color:#718096;border-bottom:2px solid transparent;transition:.2s;white-space:nowrap}
+.tab.active{color:#63b3ed;border-bottom-color:#63b3ed}
+.content{padding:20px;max-width:1100px;margin:0 auto}
+.card{background:#1a1d27;border:1px solid #2d3748;border-radius:10px;padding:18px;margin-bottom:14px}
+.card h2{font-size:14px;font-weight:600;color:#a0aec0;margin-bottom:14px}
+.slot-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.slot-card{background:#141720;border:1px solid #2d3748;border-radius:8px;padding:14px}
+.slot-card h3{font-size:13px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.dot.green{background:#48bb78}.dot.yellow{background:#ecc94b}.dot.red{background:#fc8181}.dot.grey{background:#4a5568}
+.stat{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #2d3748;font-size:12px}
+.stat:last-child{border:none}
+.stat .label{color:#718096}.stat .val{color:#e2e8f0;font-family:monospace;text-align:right;max-width:220px;overflow:hidden;text-overflow:ellipsis}
+.btn{padding:6px 12px;border:none;border-radius:6px;cursor:pointer;font-size:12px;transition:.2s}
+.btn-primary{background:#3182ce;color:#fff}.btn-primary:hover{background:#2b6cb0}
+.btn-danger{background:#c53030;color:#fff}.btn-danger:hover{background:#9b2c2c}
+.btn-success{background:#276749;color:#fff}.btn-success:hover{background:#22543d}
+.btn-grey{background:#2d3748;color:#a0aec0}.btn-grey:hover{background:#4a5568}
+.btn-sm{padding:3px 8px;font-size:11px}
+.btn-warning{background:#b7791f;color:#fff}.btn-warning:hover{background:#975a16}
+.input{background:#141720;border:1px solid #2d3748;border-radius:6px;padding:6px 10px;color:#e2e8f0;font-size:13px;width:100%}
+.input:focus{outline:none;border-color:#63b3ed}
+.select{background:#141720;border:1px solid #2d3748;border-radius:6px;padding:6px 10px;color:#e2e8f0;font-size:13px}
+.tag{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;margin:1px}
+.tag.residential{background:#276749;color:#9ae6b4}
+.tag.datacenter{background:#2c5282;color:#90cdf4}
+.tag.unknown{background:#2d3748;color:#718096}
+.tag.proxy{background:#553c9a;color:#d6bcfa}
+.tag.available{background:#276749;color:#9ae6b4}
+.tag.unavail{background:#742a2a;color:#feb2b2}
+.tag.notcheck{background:#2d3748;color:#a0aec0}
+.tag.tcp{background:#1a365d;color:#90cdf4}
+.tag.udp{background:#322659;color:#d6bcfa}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:7px 10px;color:#718096;font-weight:500;border-bottom:1px solid #2d3748;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid #1a1d27;vertical-align:middle}
+tr:hover td{background:#141720}
+.filter-row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+.filter-group{display:flex;flex-direction:column;gap:4px}
+.filter-group label{font-size:11px;color:#718096}
+.login-box{max-width:360px;margin:80px auto;background:#1a1d27;border:1px solid #2d3748;border-radius:12px;padding:28px}
+.login-box h2{text-align:center;margin-bottom:20px;color:#63b3ed}
+.form-group{margin-bottom:12px}
+.form-group label{display:block;font-size:12px;color:#718096;margin-bottom:5px}
+.alert{padding:8px 12px;border-radius:6px;font-size:12px;margin-top:10px}
+.alert.error{background:#742a2a33;border:1px solid #c53030;color:#feb2b2}
+.toast{position:fixed;top:16px;right:16px;background:#276749;color:#9ae6b4;padding:9px 16px;border-radius:8px;font-size:12px;z-index:9999;display:none;max-width:320px}
+.flex{display:flex}.gap-2{gap:8px}.items-center{align-items:center}.justify-between{justify-content:space-between}
+.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:16px}
+.text-sm{font-size:12px}.text-xs{font-size:11px}.text-grey{color:#718096}
+.page{display:none}.page.active{display:block}
+.ip-type-btn{padding:5px 14px;border-radius:6px;font-size:12px;cursor:pointer;border:1px solid #2d3748;background:#141720;color:#a0aec0;transition:.2s}
+.ip-type-btn.selected{background:#276749;border-color:#48bb78;color:#9ae6b4}
+.source-item{display:flex;align-items:center;gap:8px;padding:6px 8px;background:#141720;border:1px solid #2d3748;border-radius:6px;margin-bottom:6px}
+.divider{border:none;border-top:1px solid #2d3748;margin:14px 0}
+.backup-item{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#141720;border:1px solid #2d3748;border-radius:6px;margin-bottom:5px;font-size:12px}
+.primary-badge{background:#2c5282;color:#90cdf4;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600}
+.backup-badge{background:#2d3748;color:#a0aec0;padding:1px 6px;border-radius:3px;font-size:10px}
+@media(max-width:640px){.slot-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div id="loginPage" style="display:none">
+  <div class="login-box">
+    <h2>🔐 VPNGate Pro</h2>
+    <div class="form-group"><label>用户名</label><input class="input" id="loginUser" type="text" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <div class="form-group"><label>密码</label><input class="input" id="loginPass" type="password" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <button class="btn btn-primary" style="width:100%;padding:8px" onclick="doLogin()">登录</button>
+    <div id="loginErr" class="alert error" style="display:none"></div>
+  </div>
+</div>
+
+<div id="mainApp" style="display:none">
+  <div class="toast" id="toast"></div>
+  <div class="nav">
+    <h1>🌐 VPNGate Pro</h1>
+    <span class="badge" id="navBadge">加载中...</span>
+    <div style="margin-left:auto;display:flex;gap:6px">
+      <button class="btn btn-sm btn-grey" onclick="refreshAll()">🔄 刷新</button>
+      <button class="btn btn-sm btn-danger" onclick="doLogout()">退出</button>
+    </div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('dashboard')">📊 控制台</div>
+    <div class="tab" onclick="switchTab('nodes')">🗂 节点列表</div>
+    <div class="tab" onclick="switchTab('custom')">🔧 自建节点</div>
+    <div class="tab" onclick="switchTab('autoswitch')">🔁 自动切换</div>
+    <div class="tab" onclick="switchTab('xray')">🚀 xray出口</div>
+    <div class="tab" onclick="switchTab('logs')">📋 日志</div>
+    <div class="tab" onclick="switchTab('settings')">⚙️ 设置</div>
+  </div>
+
+  <!-- 控制台 -->
+  <div class="content page active" id="page-dashboard">
+    <div class="slot-grid">
+      <div class="slot-card">
+        <h3><span class="dot grey" id="s0-dot"></span>节点槽 1 · tun10 · :7920</h3>
+        <div class="stat"><span class="label">状态</span><span class="val" id="s0-status">-</span></div>
+        <div class="stat"><span class="label">节点</span><span class="val" id="s0-node">-</span></div>
+        <div class="stat"><span class="label">出口 IP</span><span class="val" id="s0-ip">-</span></div>
+        <div class="stat"><span class="label">延迟</span><span class="val" id="s0-lat">-</span></div>
+        <div class="stat"><span class="label">主/备</span><span class="val" id="s0-primary">-</span></div>
+        <div class="mt-3 flex gap-2">
+          <button class="btn btn-sm btn-danger" onclick="stopSlot(0)">断开</button>
+          <button class="btn btn-sm btn-grey" onclick="checkSlot(0)">检测出口</button>
+          <button class="btn btn-sm btn-grey" onclick="switchSlot(0)">切换节点</button>
+        </div>
+      </div>
+      <div class="slot-card">
+        <h3><span class="dot grey" id="s1-dot"></span>节点槽 2 · tun11 · :7921</h3>
+        <div class="stat"><span class="label">状态</span><span class="val" id="s1-status">-</span></div>
+        <div class="stat"><span class="label">节点</span><span class="val" id="s1-node">-</span></div>
+        <div class="stat"><span class="label">出口 IP</span><span class="val" id="s1-ip">-</span></div>
+        <div class="stat"><span class="label">延迟</span><span class="val" id="s1-lat">-</span></div>
+        <div class="stat"><span class="label">主/备</span><span class="val" id="s1-primary">-</span></div>
+        <div class="mt-3 flex gap-2">
+          <button class="btn btn-sm btn-danger" onclick="stopSlot(1)">断开</button>
+          <button class="btn btn-sm btn-grey" onclick="checkSlot(1)">检测出口</button>
+          <button class="btn btn-sm btn-grey" onclick="switchSlot(1)">切换节点</button>
+        </div>
+      </div>
+    </div>
+    <div class="card mt-3">
+      <h2>⚡ 快速连接</h2>
+      <div class="flex gap-2 items-center">
+        <select class="select" id="quickNode" style="flex:1"></select>
+        <select class="select" id="quickSlot"><option value="0">槽 1</option><option value="1">槽 2</option></select>
+        <button class="btn btn-primary" onclick="quickConnect()">连接</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 节点列表 -->
+  <div class="content page" id="page-nodes">
+    <div class="card">
+      <div class="flex justify-between items-center">
+        <h2>🗂 节点列表</h2>
+        <div class="flex gap-2">
+          <button class="btn btn-sm btn-grey" onclick="fetchNodes()">拉取节点</button>
+          <button class="btn btn-sm btn-primary" onclick="testCurrentPage()">测试当前页</button>
+        </div>
+      </div>
+      <div class="filter-row mt-2">
+        <div class="filter-group"><label>状态</label>
+          <select class="select" id="flStatus" onchange="gotoPage(1)">
+            <option value="">全部</option><option value="available">可用</option>
+            <option value="not_checked">未测试</option><option value="unavailable">不可用</option>
+          </select>
+        </div>
+        <div class="filter-group"><label>国家</label>
+          <select class="select" id="flCountry" onchange="gotoPage(1)"><option value="">全部</option></select>
+        </div>
+        <div class="filter-group"><label>IP类型</label>
+          <select class="select" id="flIpType" onchange="gotoPage(1)">
+            <option value="">全部</option><option value="residential">住宅</option>
+            <option value="datacenter">机房</option><option value="proxy">代理/VPN</option>
+          </select>
+        </div>
+        <div class="filter-group"><label>协议</label>
+          <select class="select" id="flProto" onchange="gotoPage(1)">
+            <option value="">全部</option><option value="tcp">TCP</option><option value="udp">UDP</option>
+          </select>
+        </div>
+        <div class="filter-group"><label>每页数量</label>
+          <select class="select" id="pageSize" onchange="gotoPage(1)">
+            <option value="20">20</option><option value="50" selected>50</option>
+            <option value="100">100</option><option value="200">200</option>
+          </select>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr>
+            <th>国家/地区</th><th>IP</th><th>协议</th><th>延迟</th>
+            <th>IP类型</th><th>状态</th><th>归属/位置</th><th>操作</th>
+          </tr></thead>
+          <tbody id="nodeTable"></tbody>
+        </table>
+      </div>
+      <div class="flex items-center gap-2 mt-3" id="pagination" style="justify-content:center"></div>
+    </div>
+  </div>
+
+  <!-- 自建节点 -->
+  <div class="content page" id="page-custom">
+    <div class="card">
+      <h2>➕ 添加自建 SOCKS5 节点</h2>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+        <div class="filter-group"><label>备注名称 *</label><input class="input" id="cn-name" placeholder="例如：JP住宅节点"></div>
+        <div class="filter-group"><label>服务器地址 *</label><input class="input" id="cn-host" placeholder="IP 或域名"></div>
+        <div class="filter-group"><label>端口 *</label><input class="input" id="cn-port" type="number" placeholder="1080"></div>
+        <div class="filter-group"><label>用户名（可选）</label><input class="input" id="cn-user" placeholder="无认证留空"></div>
+        <div class="filter-group"><label>密码（可选）</label><input class="input" id="cn-pass" type="password" placeholder="无认证留空"></div>
+        <div class="filter-group"><label>备注（可选）</label><input class="input" id="cn-note" placeholder="例如：住宅IP 美国"></div>
+      </div>
+      <button class="btn btn-primary" onclick="addCustomNode()">➕ 添加</button>
+    </div>
+    <div class="card">
+      <h2>📋 自建节点列表</h2>
+      <table>
+        <thead><tr><th>名称</th><th>地址</th><th>端口</th><th>认证</th><th>延迟</th><th>当前槽</th><th>备注</th><th>操作</th></tr></thead>
+        <tbody id="customTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 自动切换 -->
+  <div class="content page" id="page-autoswitch">
+    <div id="slotSwitchCards"></div>
+    <button class="btn btn-primary mt-3" onclick="saveSlotConfigs()">💾 保存配置</button>
+  </div>
+
+  <!-- xray 出口 -->
+  <div class="content page" id="page-xray">
+    <div class="card">
+      <h2>🚀 xray 协议出口配置</h2>
+      <p class="text-xs text-grey" style="margin-bottom:14px">每个协议独立配置出口槽，修改后自动热重载 xray。</p>
+      <div id="xrayRoutingCards"></div>
+      <button class="btn btn-primary mt-3" onclick="saveXrayDispatch()">💾 保存并应用</button>
+    </div>
+  </div>
+
+  <!-- 日志 -->
+  <div class="content page" id="page-logs">
+    <div class="card">
+      <h2>📋 运行日志</h2>
+      <div id="logContent" style="font-family:monospace;font-size:11px;color:#a0aec0;max-height:500px;overflow-y:auto;background:#0f1117;padding:10px;border-radius:6px"></div>
+    </div>
+  </div>
+
+  <!-- 设置 -->
+  <div class="content page" id="page-settings">
+    <div class="card">
+      <h2>🔐 修改登录信息</h2>
+      <div style="max-width:360px">
+        <div class="form-group mt-2"><label class="text-xs text-grey">新用户名</label><input class="input mt-2" id="newUser" placeholder="留空不修改"></div>
+        <div class="form-group mt-2"><label class="text-xs text-grey">新密码</label><input class="input mt-2" id="newPass" type="password" placeholder="留空不修改"></div>
+        <div class="form-group mt-2"><label class="text-xs text-grey">确认密码</label><input class="input mt-2" id="newPass2" type="password" placeholder="再次输入新密码"></div>
+        <button class="btn btn-primary mt-3" onclick="saveCredentials()">💾 保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let SESSION = localStorage.getItem('vpn_session') || '';
+let allNodes = [], slotConfigs = {};
+let currentPage = 1, filteredNodes = [];
+
+const XRAY_TAGS = {
+  'reality-vision': 'VLESS-Reality (:25476)',
+  'vmess-xr':       'VMess-WS (:6123)',
+  'socks5-xr':      'SOCKS5 (:42447)',
+};
+const SOURCE_LABELS = {
+  'vpngate_residential':'🏘 VPNGate 住宅IP',
+  'vpngate_datacenter':'🏢 VPNGate 机房IP',
+  'vpngate_any':'🌐 VPNGate 任意',
+};
+
+async function api(path, opts={}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: {'X-Session': SESSION, 'Content-Type':'application/json', ...(opts.headers||{})},
+  });
+  if (res.status === 401) { showLogin(); return null; }
+  return res.json().catch(()=>null);
+}
+
+function showToast(msg, isErr=false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = isErr ? '#742a2a' : '#276749';
+  t.style.color = isErr ? '#feb2b2' : '#9ae6b4';
+  t.style.display = 'block';
+  clearTimeout(t._tid);
+  t._tid = setTimeout(()=>t.style.display='none', 3500);
+}
+
+function showLogin() {
+  document.getElementById('loginPage').style.display='block';
+  document.getElementById('mainApp').style.display='none';
+}
+function showApp() {
+  document.getElementById('loginPage').style.display='none';
+  document.getElementById('mainApp').style.display='block';
+}
+
+async function doLogin() {
+  const u = document.getElementById('loginUser').value;
+  const p = document.getElementById('loginPass').value;
+  const r = await fetch('/api/login', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username:u, password:p}),
+  });
+  const d = await r.json();
+  if (d.token) {
+    SESSION = d.token; localStorage.setItem('vpn_session', SESSION);
+    showApp(); refreshAll();
+  } else {
+    const el = document.getElementById('loginErr');
+    el.textContent = d.error || '登录失败'; el.style.display = 'block';
+  }
+}
+function doLogout() { SESSION=''; localStorage.removeItem('vpn_session'); showLogin(); }
+
+function switchTab(name) {
+  const pages = ['dashboard','nodes','custom','autoswitch','xray','logs','settings'];
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active', pages[i]===name));
+  document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active', p.id==='page-'+name));
+  if(name==='nodes') loadNodes();
+  if(name==='custom') loadCustomNodes();
+  if(name==='autoswitch') loadAutoSwitch();
+  if(name==='xray') loadXrayDispatch();
+  if(name==='logs') loadLogs();
+  if(name==='settings') {}
+}
+
+async function refreshAll() {
+  const d = await api('/api/status');
+  if (!d) return;
+  document.getElementById('navBadge').textContent =
+    `S1:${d.slots[0].node_id?'已连接':'未连接'} | S2:${d.slots[1].node_id?'已连接':'未连接'}`;
+  for (let i=0; i<2; i++) {
+    const s = d.slots[i];
+    document.getElementById(`s${i}-dot`).className = 'dot '+(s.proxy_ok?'green':s.node_id?'yellow':'grey');
+    document.getElementById(`s${i}-status`).textContent = s.status_msg||'-';
+    document.getElementById(`s${i}-node`).textContent = s.node_id||'-';
+    document.getElementById(`s${i}-ip`).textContent = s.proxy_ip||'-';
+    document.getElementById(`s${i}-lat`).textContent = s.latency_ms?s.latency_ms+'ms':'-';
+    const primaryEl = document.getElementById(`s${i}-primary`);
+    if (s.node_id) {
+      primaryEl.textContent = s.using_backup ? '⚠️ 使用备用节点' : (s.primary_id ? '✅ 主节点' : '-');
+    } else {
+      primaryEl.textContent = '-';
+    }
+  }
+  // 快速连接下拉
+  const sel = document.getElementById('quickNode');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">-- 选择节点 --</option>';
+  (d.nodes||[]).filter(n=>n.probe_status==='available').forEach(n=>{
+    const o = document.createElement('option');
+    o.value = n.id;
+    const loc = n.location ? ` · ${n.location}` : '';
+    o.textContent = `${n.country||''}${loc} ${n.ip} ${n.latency_ms?n.latency_ms+'ms':''} [${n.proto||'tcp'}] ${n.quality||''}`;
+    sel.appendChild(o);
+  });
+  if (cur) sel.value = cur;
+}
+
+// ── 节点列表（分页） ──
+async function loadNodes() {
+  const d = await api('/api/nodes');
+  if (!d) return;
+  allNodes = d.nodes||[];
+  const cs = document.getElementById('flCountry');
+  const cur = cs.value;
+  cs.innerHTML = '<option value="">全部</option>';
+  const countries = [...new Set(allNodes.map(n=>n.country).filter(Boolean))].sort();
+  countries.forEach(c=>{ const o=document.createElement('option'); o.value=c; o.textContent=c; cs.appendChild(o); });
+  cs.value = cur;
+  gotoPage(1);
+}
+
+function getFilteredNodes() {
+  const sf = document.getElementById('flStatus').value;
+  const cf = document.getElementById('flCountry').value;
+  const tf = document.getElementById('flIpType').value;
+  const pf = document.getElementById('flProto').value;
+  let nodes = allNodes;
+  if (sf) nodes = nodes.filter(n=>n.probe_status===sf);
+  if (cf) nodes = nodes.filter(n=>n.country===cf);
+  if (tf) nodes = nodes.filter(n=>n.ip_type===tf);
+  if (pf) nodes = nodes.filter(n=>(n.proto||'tcp')===pf);
+  return nodes;
+}
+
+function gotoPage(page) {
+  filteredNodes = getFilteredNodes();
+  const pageSize = parseInt(document.getElementById('pageSize')?.value||'50');
+  const totalPages = Math.max(1, Math.ceil(filteredNodes.length / pageSize));
+  currentPage = Math.max(1, Math.min(page, totalPages));
+  const start = (currentPage-1)*pageSize;
+  renderNodePage(filteredNodes.slice(start, start+pageSize), totalPages, pageSize);
+}
+
+function renderNodePage(nodes, totalPages, pageSize) {
+  const tbody = document.getElementById('nodeTable');
+  tbody.innerHTML = '';
+  const IP_TYPE_MAP = {residential:['住宅','residential'],datacenter:['机房','datacenter'],
+    proxy:['代理','proxy'],unknown:['未知','unknown'],mobile:['移动','residential']};
+  const ST_MAP = {available:['可用','available'],unavailable:['不可用','unavail'],not_checked:['未测试','notcheck']};
+  nodes.forEach(n=>{
+    const geo = [n.country, n.location].filter(Boolean).join(' · ');
+    const [itLabel, itClass] = IP_TYPE_MAP[n.ip_type]||['未知','unknown'];
+    const [stLabel, stClass] = ST_MAP[n.probe_status]||['未知','notcheck'];
+    const proto = n.proto||'tcp';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${geo||'-'} <span style="font-size:10px;color:#4a5568">${n.country_short||''}</span></td>
+      <td style="font-family:monospace">${n.ip||'-'}</td>
+      <td><span class="tag ${proto}">${proto.toUpperCase()}</span></td>
+      <td>${n.latency_ms?n.latency_ms+'ms':'-'}</td>
+      <td><span class="tag ${itClass}">${itLabel}</span></td>
+      <td><span class="tag ${stClass}">${stLabel}</span></td>
+      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#718096">${n.as_name||n.owner||'-'}</td>
+      <td>
+        <button class="btn btn-sm btn-primary" onclick="connectNode('${n.id}',0)">→槽1</button>
+        <button class="btn btn-sm btn-grey" onclick="connectNode('${n.id}',1)">→槽2</button>
+        <button class="btn btn-sm btn-success" onclick="testOneNode('${n.id}',this)">测试</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+  if (!nodes.length) tbody.innerHTML='<tr><td colspan="8" style="text-align:center;padding:20px;color:#718096">无节点数据</td></tr>';
+
+  const pg = document.getElementById('pagination');
+  pg.innerHTML = '';
+  const info = document.createElement('span');
+  info.className = 'text-xs text-grey';
+  info.textContent = `共 ${filteredNodes.length} 个，第 ${currentPage}/${totalPages} 页`;
+  pg.appendChild(info);
+  const bs = 'padding:4px 10px;border-radius:4px;border:1px solid #2d3748;background:#141720;color:#a0aec0;cursor:pointer;font-size:12px;margin:0 2px';
+  const ba = bs+';background:#2b4c7e;border-color:#63b3ed;color:#90cdf4';
+  if (totalPages > 1) {
+    const prev = document.createElement('button');
+    prev.textContent='‹'; prev.style.cssText=bs; prev.disabled=currentPage===1;
+    prev.onclick=()=>gotoPage(currentPage-1); pg.appendChild(prev);
+    let s=Math.max(1,currentPage-3), e=Math.min(totalPages,s+6); s=Math.max(1,e-6);
+    for(let i=s;i<=e;i++){
+      const btn=document.createElement('button'); btn.textContent=i;
+      btn.style.cssText=i===currentPage?ba:bs;
+      btn.onclick=(()=>{const p=i;return()=>gotoPage(p)})(); pg.appendChild(btn);
+    }
+    const next=document.createElement('button');
+    next.textContent='›'; next.style.cssText=bs; next.disabled=currentPage===totalPages;
+    next.onclick=()=>gotoPage(currentPage+1); pg.appendChild(next);
+  }
+}
+
+async function testCurrentPage() {
+  const pageSize = parseInt(document.getElementById('pageSize')?.value||'50');
+  const start = (currentPage-1)*pageSize;
+  const ids = filteredNodes.slice(start, start+pageSize).map(n=>n.id);
+  if (!ids.length) return showToast('当前页无节点', true);
+  showToast(`后台测试 ${ids.length} 个节点...`);
+  const r = await api('/api/test_nodes', {method:'POST', body:JSON.stringify({node_ids:ids})});
+  showToast(r&&r.ok?`已开始测试 ${r.count} 个节点`:'失败', !(r&&r.ok));
+}
+
+// ── 自建节点 ──
+async function loadCustomNodes() {
+  const d = await api('/api/custom_nodes');
+  if (!d) return;
+  const tbody = document.getElementById('customTable');
+  tbody.innerHTML = '';
+  const nodes = d.nodes||[];
+  if (!nodes.length) {
+    tbody.innerHTML='<tr><td colspan="8" style="text-align:center;padding:20px;color:#718096">暂无自建节点</td></tr>';
+    return;
+  }
+  nodes.forEach(n=>{
+    const slotLabel = n.active_slot>=0?`<span class="tag available">槽${n.active_slot+1}</span>`:'<span class="tag notcheck">-</span>';
+    const tr = document.createElement('tr');
+    tr.innerHTML=`
+      <td style="font-weight:600">${n.name}</td>
+      <td style="font-family:monospace">${n.host}</td>
+      <td style="font-family:monospace">${n.port}</td>
+      <td><span class="tag ${n.username?'available':'unknown'}">${n.username?'有认证':'无认证'}</span></td>
+      <td>${n.latency_ms?n.latency_ms+'ms':'-'}</td>
+      <td>${slotLabel}</td>
+      <td style="color:#718096;font-size:11px">${n.note||''}</td>
+      <td>
+        <button class="btn btn-sm btn-primary" onclick="connectCustom('${n.id}',0)">→槽1</button>
+        <button class="btn btn-sm btn-grey" onclick="connectCustom('${n.id}',1)">→槽2</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteCustom('${n.id}')">删除</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function addCustomNode() {
+  const name=document.getElementById('cn-name').value.trim();
+  const host=document.getElementById('cn-host').value.trim();
+  const port=parseInt(document.getElementById('cn-port').value)||0;
+  if(!name||!host||!port) return showToast('名称、地址、端口必填',true);
+  const r=await api('/api/custom_nodes',{method:'POST',body:JSON.stringify({
+    action:'add',name,host,port,
+    username:document.getElementById('cn-user').value.trim(),
+    password:document.getElementById('cn-pass').value,
+    note:document.getElementById('cn-note').value.trim(),
+  })});
+  if(r&&r.ok){showToast('节点已添加');['cn-name','cn-host','cn-port','cn-user','cn-pass','cn-note'].forEach(id=>document.getElementById(id).value='');loadCustomNodes();}
+  else showToast((r&&r.error)||'添加失败',true);
+}
+
+async function deleteCustom(nodeId) {
+  const r=await api('/api/custom_nodes',{method:'POST',body:JSON.stringify({action:'delete',node_id:nodeId})});
+  showToast(r&&r.ok?'已删除':'删除失败',!(r&&r.ok)); loadCustomNodes();
+}
+
+async function connectCustom(nodeId,slot) {
+  showToast(`正在连接自建节点到槽${slot+1}...`);
+  const r=await api('/api/connect_custom',{method:'POST',body:JSON.stringify({node_id:nodeId,slot_id:slot})});
+  showToast(r&&r.ok?r.message:(r&&r.error)||'连接失败',!(r&&r.ok));
+  setTimeout(()=>{refreshAll();loadCustomNodes();},2000);
+}
+
+// ── 自动切换（主备节点） ──
+async function loadAutoSwitch() {
+  const [r, nd] = await Promise.all([api('/api/slot_configs'), api('/api/nodes')]);
+  if (!r) return;
+  slotConfigs = r.configs;
+  const nodeList = (nd&&nd.nodes||[]).filter(n=>n.probe_status==='available');
+  renderAutoSwitch(nodeList);
+}
+
+function renderAutoSwitch(nodeList) {
+  const wrap = document.getElementById('slotSwitchCards');
+  wrap.innerHTML = '';
+  for (let i=0; i<2; i++) {
+    const cfg = slotConfigs[String(i)] || {};
+    const primaryId = cfg.primary_node_id || '';
+    const backupIds = cfg.backup_node_ids || [];
+    const recoveryInterval = cfg.recovery_interval || 10;
+
+    const card = document.createElement('div');
+    card.className = 'card';
+
+    // 节点选项HTML
+    const nodeOpts = nodeList.map(n=>{
+      const loc = n.location ? ` · ${n.location}` : '';
+      return `<option value="${n.id}">${n.country||''}${loc} ${n.ip} [${n.proto||'tcp'}] ${n.latency_ms?n.latency_ms+'ms':''}</option>`;
+    }).join('');
+
+    card.innerHTML = `
+      <h2>节点槽 ${i+1} 自动切换配置</h2>
+      <div class="flex items-center gap-2 mt-2">
+        <input type="checkbox" id="as-en-${i}" ${cfg.auto_switch!==false?'checked':''}>
+        <label for="as-en-${i}" style="font-size:13px">启用自动切换</label>
+        <input type="checkbox" id="as-tcp-${i}" ${cfg.prefer_tcp!==false?'checked':''} style="margin-left:12px">
+        <label for="as-tcp-${i}" style="font-size:13px">优先TCP节点</label>
+      </div>
+      <hr class="divider">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">主节点设置</div>
+      <div class="flex gap-2 items-center">
+        <select class="select" id="primary-${i}" style="flex:1">
+          <option value="">不设主节点（自动选择）</option>
+          ${nodeOpts}
+        </select>
+        <span class="primary-badge">主节点</span>
+      </div>
+      <hr class="divider">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">备用节点列表</div>
+      <div id="backups-${i}"></div>
+      <div class="flex gap-2 mt-2">
+        <select class="select" id="backup-add-${i}" style="flex:1">
+          <option value="">选择备用节点...</option>
+          ${nodeOpts}
+        </select>
+        <button class="btn btn-sm btn-success" onclick="addBackup(${i})">➕ 添加</button>
+      </div>
+      <hr class="divider">
+      <div class="filter-group mt-2">
+        <label>主节点恢复检测间隔（分钟）</label>
+        <input class="input" id="recovery-${i}" type="number" min="1" value="${recoveryInterval}" style="max-width:120px;margin-top:4px">
+      </div>
+      <hr class="divider">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">无主节点时自动选择来源（按优先级）</div>
+      <div id="sources-${i}"></div>
+      <div class="flex gap-2 mt-2 flex-wrap">
+        ${Object.entries(SOURCE_LABELS).map(([k,v])=>`<button class="btn btn-sm btn-grey" onclick="addSource(${i},'${k}')">${v}</button>`).join('')}
+      </div>
+      <div class="filter-group mt-3">
+        <label>延迟上限 (ms，0=不限)</label>
+        <input class="input" id="as-lat-${i}" type="number" value="${cfg.max_latency_ms||0}" style="max-width:120px;margin-top:4px">
+      </div>`;
+    wrap.appendChild(card);
+
+    // 设置主节点下拉值
+    if (primaryId) {
+      const sel = document.getElementById(`primary-${i}`);
+      if (sel) sel.value = primaryId;
+    }
+
+    // 渲染备用节点列表
+    renderBackups(i, backupIds, nodeList);
+
+    // 渲染来源列表
+    renderSources(i, cfg.node_sources || ['vpngate_residential', 'vpngate_any']);
+  }
+}
+
+function renderBackups(slotId, ids, nodeList) {
+  const wrap = document.getElementById(`backups-${slotId}`);
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (!ids.length) {
+    wrap.innerHTML = '<div style="color:#718096;font-size:12px;padding:6px">（无备用节点）</div>';
+    return;
+  }
+  ids.forEach((id, idx) => {
+    const node = nodeList.find(n=>n.id===id);
+    const label = node ?
+      `${node.country||''} ${node.ip} [${node.proto||'tcp'}] ${node.latency_ms?node.latency_ms+'ms':''}` :
+      id;
+    const div = document.createElement('div');
+    div.className = 'backup-item';
+    div.innerHTML = `
+      <span class="backup-badge">备用${idx+1}</span>
+      <span style="flex:1">${label}</span>
+      ${idx>0?`<button class="btn btn-sm btn-grey" onclick="moveBackup(${slotId},${idx},-1)">↑</button>`:''}
+      ${idx<ids.length-1?`<button class="btn btn-sm btn-grey" onclick="moveBackup(${slotId},${idx},1)">↓</button>`:''}
+      <button class="btn btn-sm btn-danger" onclick="removeBackup(${slotId},${idx})">×</button>`;
+    wrap.appendChild(div);
+  });
+}
+
+function getBackupIds(slotId) {
+  // 从 slotConfigs 中读取，结合当前 UI 状态
+  return slotConfigs[String(slotId)]?.backup_node_ids?.slice() || [];
+}
+
+async function addBackup(slotId) {
+  const sel = document.getElementById(`backup-add-${slotId}`);
+  const id = sel?.value;
+  if (!id) return showToast('请选择备用节点', true);
+  const ids = getBackupIds(slotId);
+  if (ids.includes(id)) return showToast('该节点已在备用列表', true);
+  ids.push(id);
+  slotConfigs[String(slotId)] = {...(slotConfigs[String(slotId)]||{}), backup_node_ids: ids};
+  const nd = await api('/api/nodes');
+  const nodeList = (nd&&nd.nodes||[]).filter(n=>n.probe_status==='available');
+  renderBackups(slotId, ids, nodeList);
+  if (sel) sel.value = '';
+}
+
+async function removeBackup(slotId, idx) {
+  const ids = getBackupIds(slotId);
+  ids.splice(idx, 1);
+  slotConfigs[String(slotId)] = {...(slotConfigs[String(slotId)]||{}), backup_node_ids: ids};
+  const nd = await api('/api/nodes');
+  const nodeList = (nd&&nd.nodes||[]).filter(n=>n.probe_status==='available');
+  renderBackups(slotId, ids, nodeList);
+}
+
+async function moveBackup(slotId, idx, dir) {
+  const ids = getBackupIds(slotId);
+  const newIdx = idx + dir;
+  if (newIdx < 0 || newIdx >= ids.length) return;
+  [ids[idx], ids[newIdx]] = [ids[newIdx], ids[idx]];
+  slotConfigs[String(slotId)] = {...(slotConfigs[String(slotId)]||{}), backup_node_ids: ids};
+  const nd = await api('/api/nodes');
+  const nodeList = (nd&&nd.nodes||[]).filter(n=>n.probe_status==='available');
+  renderBackups(slotId, ids, nodeList);
+}
+
+function renderSources(slotId, sources) {
+  const wrap = document.getElementById(`sources-${slotId}`);
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (!sources.length) {
+    wrap.innerHTML = '<div style="color:#718096;font-size:12px;padding:8px">（无来源，将使用任意可用节点）</div>';
+    return;
+  }
+  sources.forEach((src, idx) => {
+    const div = document.createElement('div');
+    div.className = 'source-item';
+    div.innerHTML = `
+      <span style="flex:1;font-size:13px">${SOURCE_LABELS[src]||src}</span>
+      ${idx>0?`<button class="btn btn-sm btn-grey" onclick="moveSource(${slotId},${idx},-1)">↑</button>`:''}
+      ${idx<sources.length-1?`<button class="btn btn-sm btn-grey" onclick="moveSource(${slotId},${idx},1)">↓</button>`:''}
+      <button class="btn btn-sm btn-danger" onclick="removeSource(${slotId},${idx})">×</button>`;
+    wrap.appendChild(div);
+  });
+}
+
+function getSources(slotId) {
+  const wrap = document.getElementById(`sources-${slotId}`);
+  if (!wrap) return [];
+  const labelToKey = Object.fromEntries(Object.entries(SOURCE_LABELS).map(([k,v])=>[v,k]));
+  return [...wrap.querySelectorAll('.source-item span:first-child')].map(el=>labelToKey[el.textContent.trim()]||el.textContent.trim());
+}
+
+function addSource(slotId, src) {
+  const cur = getSources(slotId);
+  if (cur.includes(src)) return showToast('该来源已存在',true);
+  cur.push(src); renderSources(slotId, cur);
+}
+function removeSource(slotId, idx) { const cur=getSources(slotId); cur.splice(idx,1); renderSources(slotId,cur); }
+function moveSource(slotId, idx, dir) {
+  const cur=getSources(slotId); const ni=idx+dir;
+  if(ni<0||ni>=cur.length)return; [cur[idx],cur[ni]]=[cur[ni],cur[idx]]; renderSources(slotId,cur);
+}
+
+async function saveSlotConfigs() {
+  const configs = {};
+  for (let i=0; i<2; i++) {
+    const primarySel = document.getElementById(`primary-${i}`);
+    configs[String(i)] = {
+      auto_switch: document.getElementById(`as-en-${i}`).checked,
+      prefer_tcp:  document.getElementById(`as-tcp-${i}`).checked,
+      node_sources: getSources(i),
+      countries: slotConfigs[String(i)]?.countries || [],
+      max_latency_ms: parseInt(document.getElementById(`as-lat-${i}`)?.value)||0,
+      primary_node_id: primarySel?.value || '',
+      backup_node_ids: getBackupIds(i),
+      recovery_interval: parseInt(document.getElementById(`recovery-${i}`)?.value)||10,
+    };
+  }
+  const r = await api('/api/slot_configs', {method:'POST', body:JSON.stringify({configs})});
+  if (r&&r.ok) { slotConfigs = configs; showToast('保存成功'); }
+  else showToast('保存失败', true);
+}
+
+// ── xray 出口 ──
+async function loadXrayDispatch() {
+  const r = await api('/api/dispatch');
+  if (!r) return;
+  const cfg = r.config||{};
+  const wrap = document.getElementById('xrayRoutingCards');
+  wrap.innerHTML = '';
+  for (const [tag, label] of Object.entries(XRAY_TAGS)) {
+    const cur = cfg[tag]||'direct';
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #2d3748';
+    div.innerHTML = `
+      <span style="width:220px;font-size:13px">${label}</span>
+      <select class="select" id="xray-${tag}" style="width:180px">
+        <option value="direct" ${cur==='direct'?'selected':''}>直连（VPS原IP）</option>
+        <option value="slot0" ${cur==='slot0'?'selected':''}>槽1（:7920）</option>
+        <option value="slot1" ${cur==='slot1'?'selected':''}>槽2（:7921）</option>
+      </select>`;
+    wrap.appendChild(div);
+  }
+}
+
+async function saveXrayDispatch() {
+  const cfg = {};
+  for (const tag of Object.keys(XRAY_TAGS)) {
+    const el = document.getElementById(`xray-${tag}`);
+    if (el) cfg[tag] = el.value;
+  }
+  const r = await api('/api/dispatch', {method:'POST', body:JSON.stringify({config:cfg})});
+  showToast(r&&r.ok?'已保存并热重载 xray':'保存失败', !(r&&r.ok));
+}
+
+// ── 节点操作 ──
+async function fetchNodes() {
+  showToast('正在拉取节点...');
+  const r = await api('/api/fetch_nodes', {method:'POST'});
+  showToast(r&&r.ok?`已获取 ${r.count} 个节点`:'拉取失败', !(r&&r.ok));
+  setTimeout(loadNodes, 1000);
+}
+
+async function testOneNode(nodeId, btn) {
+  const orig = btn.textContent;
+  btn.textContent='测试中...'; btn.disabled=true;
+  try {
+    const r = await api('/api/test_node', {method:'POST', body:JSON.stringify({node_id:nodeId})});
+    if (r&&r.probe_status) {
+      const statusMap = {available:'✅ 可用', unavailable:'❌ 不可用'};
+      showToast(`${statusMap[r.probe_status]||r.probe_status} ${r.latency_ms?r.latency_ms+'ms':''} ${r.quality||''}`);
+      const node = allNodes.find(n=>n.id===nodeId);
+      if (node) { Object.assign(node, r); gotoPage(currentPage); }
+    } else showToast((r&&r.error)||'测试失败', true);
+  } finally { btn.textContent=orig; btn.disabled=false; }
+}
+
+async function connectNode(nodeId, slot) {
+  showToast(`正在连接到槽${slot+1}...`);
+  const r = await api('/api/connect', {method:'POST', body:JSON.stringify({node_id:nodeId, slot_id:slot})});
+  showToast(r&&r.ok?r.message:(r&&r.error)||'连接失败', !(r&&r.ok));
+  setTimeout(refreshAll, 3000);
+}
+
+async function quickConnect() {
+  const raw = document.getElementById('quickNode').value;
+  const slot = parseInt(document.getElementById('quickSlot').value);
+  if (!raw) return showToast('请选择节点', true);
+  await connectNode(raw, slot);
+}
+
+async function stopSlot(slot) {
+  const r = await api('/api/stop', {method:'POST', body:JSON.stringify({slot_id:slot})});
+  showToast(r&&r.ok?`槽${slot+1}已断开`:'操作失败', !(r&&r.ok));
+  setTimeout(refreshAll, 500);
+}
+
+async function checkSlot(slot) {
+  showToast(`检测槽${slot+1}出口...`);
+  const r = await api('/api/check_proxy', {method:'POST', body:JSON.stringify({slot_id:slot})});
+  showToast(r&&r.ok?`出口IP: ${r.ip}`:'检测失败', !(r&&r.ok));
+  setTimeout(refreshAll, 500);
+}
+
+async function switchSlot(slot) {
+  showToast(`槽${slot+1}触发切换...`);
+  const r = await api('/api/switch_slot', {method:'POST', body:JSON.stringify({slot_id:slot})});
+  showToast(r&&r.ok?'切换指令已发送':'切换失败', !(r&&r.ok));
+  setTimeout(refreshAll, 3000);
+}
+
+// ── 日志 ──
+async function loadLogs() {
+  const d = await api('/api/logs');
+  if (!d) return;
+  const el = document.getElementById('logContent');
+  el.innerHTML = (d.logs||[]).map(l=>
+    `<div style="color:${l.level==='ERROR'?'#fc8181':l.level==='WARNING'?'#ecc94b':'#718096'}">[${l.timestamp}][${l.level}][${l.module}] ${l.message}</div>`
+  ).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── 设置 ──
+async function saveCredentials() {
+  const newUser = document.getElementById('newUser').value.trim();
+  const newPass = document.getElementById('newPass').value;
+  const newPass2 = document.getElementById('newPass2').value;
+  if (newPass && newPass !== newPass2) return showToast('两次密码不一致', true);
+  if (!newUser && !newPass) return showToast('请填写要修改的内容', true);
+  const r = await api('/api/update_credentials', {method:'POST', body:JSON.stringify({
+    username: newUser||undefined, password: newPass||undefined,
+  })});
+  if (r&&r.ok) { showToast('已更新，请重新登录'); setTimeout(doLogout, 1500); }
+  else showToast((r&&r.error)||'保存失败', true);
+}
+
+(async()=>{
+  if (SESSION) {
+    const d = await api('/api/status');
+    if (d) { showApp(); refreshAll(); }
+    else showLogin();
+  } else showLogin();
+  setInterval(refreshAll, 12000);
+})();
+</script>
+</body>
+</html>"""
+
+# ── Web Handler ──────────────────────────────────────────────────────
+class WebHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass
+
+    def _send_json(self, data: Any, status: int = 200) -> None:
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _check_session(self) -> bool:
+        token = self.headers.get("X-Session", "")
+        now = time.time()
+        if token in WEB_SESSIONS and now - WEB_SESSIONS[token] < SESSION_TTL:
+            WEB_SESSIONS[token] = now; return True
+        return False
+
+    def _read_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0: return {}
+        try: return json.loads(self.rfile.read(length))
+        except Exception: return {}
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if path in ("/", "/index.html"):
+            body = HTML_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if not self._check_session():
+            self._send_json({"error": "未授权"}, 401); return
+        path_map = {
+            "/api/status":      self._handle_status,
+            "/api/nodes":       lambda: self._send_json({"nodes": read_json(NODES_FILE, [])}),
+            "/api/custom_nodes":lambda: self._send_json({"nodes": read_json(CUSTOM_NODES_FILE, [])}),
+            "/api/slot_configs":lambda: self._send_json({"configs": load_slot_configs()}),
+            "/api/dispatch":    lambda: self._send_json({"config": load_xray_dispatch()}),
+            "/api/logs":        self._handle_logs,
+            "/api/ui_config":   lambda: self._send_json({"port": load_ui_config().get("port", 8787)}),
+        }
+        handler = path_map.get(path)
+        if handler: handler()
+        else: self._send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/login":
+            body = self._read_body()
+            cfg = load_ui_config()
+            if body.get("username") == cfg["username"] and body.get("password") == cfg["password"]:
+                token = session_token(cfg["username"], cfg["password"])
+                WEB_SESSIONS[token] = time.time()
+                self._send_json({"token": token})
+            else:
+                self._send_json({"error": "用户名或密码错误"}, 401)
+            return
+        if not self._check_session():
+            self._send_json({"error": "未授权"}, 401); return
+        body = self._read_body()
+        handlers = {
+            "/api/connect":             lambda: self._handle_connect(body),
+            "/api/connect_custom":      lambda: self._handle_connect_custom(body),
+            "/api/stop":                lambda: self._handle_stop(body),
+            "/api/switch_slot":         lambda: self._handle_switch_slot(body),
+            "/api/fetch_nodes":         lambda: self._handle_fetch_nodes(),
+            "/api/test_nodes":          lambda: self._handle_test_nodes(body),
+            "/api/test_node":           lambda: self._handle_test_node_sync(body),
+            "/api/check_proxy":         lambda: self._handle_check_proxy(body),
+            "/api/custom_nodes":        lambda: self._handle_custom_nodes(body),
+            "/api/slot_configs":        lambda: self._handle_save_slot_configs(body),
+            "/api/dispatch":            lambda: self._handle_save_dispatch(body),
+            "/api/update_credentials":  lambda: self._handle_update_credentials(body),
+        }
+        handler = handlers.get(path)
+        if handler: handler()
+        else: self._send_json({"error": "not found"}, 404)
+
+    def _handle_status(self):
+        slots_info = []
+        for s in SLOTS:
+            st = slot_states[s["id"]]
+            slots_info.append({
+                "slot_id": s["id"], "node_id": st.node_id,
+                "node_type": st.node_type, "status_msg": st.status_msg,
+                "is_connecting": st.is_connecting, "proxy_ok": st.proxy_ok,
+                "proxy_ip": st.proxy_ip, "latency_ms": st.latency_ms,
+                "using_backup": st.using_backup, "primary_id": st.primary_id,
+            })
+        nodes = read_json(NODES_FILE, [])
+        self._send_json({
+            "slots": slots_info,
+            "nodes": [n for n in nodes if n.get("probe_status") == "available"][:80],
+        })
+
+    def _handle_connect(self, body):
+        node_id = body.get("node_id", "")
+        slot_id = int(body.get("slot_id", 0))
+        if not node_id:
+            self._send_json({"error": "缺少 node_id"}, 400); return
+        threading.Thread(target=_safe_connect, args=(slot_id, node_id), daemon=True).start()
+        self._send_json({"ok": True, "message": f"正在连接 {node_id} → 槽{slot_id+1}"})
+
+    def _handle_connect_custom(self, body):
+        node_id = body.get("node_id", "")
+        slot_id = int(body.get("slot_id", 0))
+        nodes = read_json(CUSTOM_NODES_FILE, [])
+        node = next((n for n in nodes if n["id"] == node_id), None)
+        if not node:
+            self._send_json({"error": "节点不存在"}, 404); return
+        threading.Thread(target=_safe_connect_custom, args=(slot_id, node), daemon=True).start()
+        self._send_json({"ok": True, "message": f"正在连接 {node['name']} → 槽{slot_id+1}"})
+
+    def _handle_stop(self, body):
+        stop_slot(int(body.get("slot_id", 0)))
+        self._send_json({"ok": True})
+
+    def _handle_switch_slot(self, body):
+        slot_id = int(body.get("slot_id", 0))
+        threading.Thread(target=auto_switch_slot, args=(slot_id,), daemon=True).start()
+        self._send_json({"ok": True})
+
+    def _handle_fetch_nodes(self):
+        def do():
+            try:
+                candidates = fetch_candidates()
+                with lock:
+                    existing = {n["id"]: n for n in read_json(NODES_FILE, [])}
+                merged, seen = [], set()
+                for c in candidates:
+                    if c["id"] in existing:
+                        ex = existing[c["id"]]
+                        ex["config_text"] = c["config_text"]
+                        ex["fetched_at"]  = c["fetched_at"]
+                        merged.append(ex)
+                    else:
+                        merged.append(c)
+                    seen.add(c["id"])
+                for nid, n in existing.items():
+                    if nid not in seen: merged.append(n)
+                write_json(NODES_FILE, sort_nodes(merged[:1000]))
+            except Exception as e:
+                log("ERROR", "Fetch", str(e))
+        threading.Thread(target=do, daemon=True).start()
+        count = len(read_json(NODES_FILE, []))
+        self._send_json({"ok": True, "count": count})
+
+    def _handle_test_nodes(self, body):
+        node_ids = body.get("node_ids")
+        if node_ids:
+            ids = node_ids
+        else:
+            count = int(body.get("count", 10))
+            nodes = read_json(NODES_FILE, [])
+            ids = [n["id"] for n in nodes if n.get("probe_status") == "not_checked"][:count]
+        threading.Thread(target=batch_test_nodes, args=(ids,), daemon=True).start()
+        self._send_json({"ok": True, "count": len(ids)})
+
+    def _handle_test_node_sync(self, body):
+        node_id = body.get("node_id", "")
+        nodes = read_json(NODES_FILE, [])
+        node = next((n for n in nodes if n["id"] == node_id), None)
+        if not node:
+            self._send_json({"error": "节点不存在"}, 404); return
+        updates = test_node_sync(node)
+        with lock:
+            ns = read_json(NODES_FILE, [])
+            for n in ns:
+                if n["id"] == node_id: n.update(updates)
+            write_json(NODES_FILE, sort_nodes(ns))
+        self._send_json({"ok": True, **updates})
+
+    def _handle_check_proxy(self, body):
+        slot_id = int(body.get("slot_id", 0))
+        result = check_slot_proxy(slot_id)
+        st = slot_states[slot_id]
+        st.proxy_ok = result["ok"]
+        st.proxy_ip = result.get("ip", "")
+        self._send_json(result)
+
+    def _handle_custom_nodes(self, body):
+        action = body.get("action", "")
+        if action == "add":
+            name = body.get("name", "").strip()
+            host = body.get("host", "").strip()
+            port = int(body.get("port", 0))
+            if not name or not host or not port:
+                self._send_json({"error": "名称、地址、端口为必填项"}, 400); return
+            node = {
+                "id": "custom_" + _uuid_mod.uuid4().hex[:8],
+                "node_type": "custom", "name": name, "host": host, "port": port,
+                "username": body.get("username", ""), "password": body.get("password", ""),
+                "note": body.get("note", ""), "latency_ms": 0, "active_slot": -1,
+                "created_at": time.time(),
+            }
+            nodes = read_json(CUSTOM_NODES_FILE, [])
+            nodes.append(node)
+            write_json(CUSTOM_NODES_FILE, nodes)
+            self._send_json({"ok": True, "node_id": node["id"]})
+        elif action == "delete":
+            node_id = body.get("node_id", "")
+            nodes = [n for n in read_json(CUSTOM_NODES_FILE, []) if n["id"] != node_id]
+            write_json(CUSTOM_NODES_FILE, nodes)
+            self._send_json({"ok": True})
+        else:
+            self._send_json({"error": "未知 action"}, 400)
+
+    def _handle_save_slot_configs(self, body):
+        save_slot_configs(body.get("configs", {}))
+        self._send_json({"ok": True})
+
+    def _handle_save_dispatch(self, body):
+        cfg = body.get("config", {})
+        save_xray_dispatch(cfg)
+        threading.Thread(target=apply_xray_dispatch, args=(cfg,), daemon=True).start()
+        self._send_json({"ok": True})
+
+    def _handle_update_credentials(self, body):
+        cfg = load_ui_config()
+        new_user = body.get("username", "").strip()
+        new_pass = body.get("password", "")
+        if new_user: cfg["username"] = new_user
+        if new_pass: cfg["password"] = new_pass
+        if not new_user and not new_pass:
+            self._send_json({"error": "未提供修改内容"}, 400); return
+        save_ui_config(cfg)
+        WEB_SESSIONS.clear()
+        self._send_json({"ok": True})
+
+    def _handle_logs(self):
+        logs = []
+        lf = LOGS_DIR / f"{time.strftime('%Y-%m-%d')}.json"
+        if lf.exists():
+            for line in lf.read_text(encoding="utf-8").splitlines()[-300:]:
+                try: logs.append(json.loads(line))
+                except Exception: pass
+        self._send_json({"logs": logs[-300:]})
+
+
+def _safe_connect(slot_id: int, node_id: str) -> None:
+    try: connect_slot(slot_id, node_id)
+    except Exception as e: log("ERROR", "API", f"connect_slot({slot_id},{node_id}): {e}")
+
+def _safe_connect_custom(slot_id: int, node: dict) -> None:
+    try: connect_custom_socks5(slot_id, node)
+    except Exception as e: log("ERROR", "API", f"connect_custom({slot_id}): {e}")
+
+
+def main():
+    ensure_dirs()
+    log("INFO", "Main", "VPNGate Pro 启动")
+    # 清理旧的 iptables 残留规则
+    try:
+        subprocess.run(["iptables", "-t", "nat", "-F", "OUTPUT"], capture_output=True)
+        log("INFO", "Main", "已清理 iptables NAT OUTPUT 规则")
+    except Exception:
+        pass
+
+    proxy_mod.start_proxy_servers()
+
+    # 启动时恢复 xray 调度配置
+    dispatch_cfg = load_xray_dispatch()
+    if any(v != "direct" for v in dispatch_cfg.values()):
+        threading.Thread(target=apply_xray_dispatch, args=(dispatch_cfg,), daemon=True).start()
+
+    def startup_fetch():
+        try:
+            candidates = fetch_candidates()
+            existing = {n["id"]: n for n in read_json(NODES_FILE, [])}
+            merged, seen = [], set()
+            for c in candidates:
+                merged.append(existing.get(c["id"], c)); seen.add(c["id"])
+            for nid, n in existing.items():
+                if nid not in seen: merged.append(n)
+            write_json(NODES_FILE, sort_nodes(merged[:1000]))
+            to_test = [n for n in merged
+                       if n.get("probe_status") == "not_checked"
+                       and n.get("proto", "tcp") == "tcp"][:6]
+            if to_test:
+                batch_test_nodes([n["id"] for n in to_test])
+        except Exception as e:
+            log("ERROR", "Startup", str(e))
+
+    threading.Thread(target=startup_fetch, daemon=True).start()
+    threading.Thread(target=health_monitor, daemon=True).start()
+    threading.Thread(target=refresh_nodes_loop, daemon=True).start()
+    threading.Thread(target=xray_watchdog, daemon=True).start()
+
+    cfg  = load_ui_config()
+    host = cfg.get("host", "0.0.0.0")
+    port = int(cfg.get("port", 8787))
+    server = ThreadingHTTPServer((host, port), WebHandler)
+    log("INFO", "WebUI", f"地址: http://{host}:{port}/  用户名: {cfg['username']}  密码: {cfg['password']}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("INFO", "Main", "退出...")
+        for sid in range(2): stop_slot(sid)
+        proxy_mod.stop_proxy_servers()
+
+if __name__ == "__main__":
+    main()
