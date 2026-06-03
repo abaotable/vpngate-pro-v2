@@ -32,7 +32,7 @@ INSTALL_DIR="/opt/vpngate-pro"
 DATA_DIR="/var/lib/vpngate-pro"
 SERVICE_NAME="vpngate-pro"
 # ↓ 替换为你自己的 GitHub 仓库地址
-REPO_RAW="https://raw.githubusercontent.com/YOUR_GITHUB/vpngate-pro/main"
+REPO_RAW="https://raw.githubusercontent.com/abaotable/vpngate-pro-v2/main"
 
 # ── 安装依赖 ────────────────────────────────────────────────────────
 section "安装依赖"
