@@ -700,25 +700,40 @@ def connect_custom_socks5(slot_id: int, node: dict) -> str:
         st.is_connecting = False
 
 def check_slot_proxy(slot_id: int) -> dict[str, Any]:
+    """通过 SOCKS5 代理检测出口 IP（microsocks 是 SOCKS5，不是 HTTP 代理）"""
     proxy_port = SLOTS[slot_id]["proxy_port"]
-    for url in [
-        "https://ipinfo.io/json",
-        "https://api.ipify.org?format=json",
-    ]:
-        try:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({
-                    "http":  f"http://127.0.0.1:{proxy_port}",
-                    "https": f"http://127.0.0.1:{proxy_port}",
-                }))
-            t0 = time.time()
-            with opener.open(url, timeout=12) as resp:
-                data = json.loads(resp.read())
-            ip = data.get("ip") or data.get("query", "")
-            return {"ok": True, "ip": ip, "latency_ms": int((time.time()-t0)*1000)}
-        except Exception:
-            continue
-    return {"ok": False, "error": "出口检测失败"}
+    try:
+        import socket as _socket
+        SO_MARK = 36
+        # 用 tun IP 作为源地址直连 ipinfo.io（与 microsocks 出口一致）
+        tun_ip = slot_states[slot_id].tun_ip
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.settimeout(12)
+        if tun_ip:
+            try:
+                sock.setsockopt(_socket.SOL_SOCKET, SO_MARK,
+                                SLOTS[slot_id]["table"])
+                sock.bind((tun_ip, 0))
+            except Exception:
+                pass
+        t0 = time.time()
+        sock.connect(("ipinfo.io", 443))
+        import ssl
+        ctx = ssl.create_default_context()
+        ssock = ctx.wrap_socket(sock, server_hostname="ipinfo.io")
+        ssock.sendall(b"GET /json HTTP/1.1\r\nHost: ipinfo.io\r\nConnection: close\r\n\r\n")
+        resp = b""
+        while True:
+            chunk = ssock.recv(4096)
+            if not chunk: break
+            resp += chunk
+        ssock.close()
+        body = resp.split(b"\r\n\r\n", 1)[-1].decode(errors="replace")
+        data = json.loads(body)
+        ip = data.get("ip", "")
+        return {"ok": bool(ip), "ip": ip, "latency_ms": int((time.time()-t0)*1000)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ── 自动切换（主备节点逻辑） ──────────────────────────────────────────
 def _get_node_by_id(node_id: str) -> dict | None:
@@ -812,20 +827,29 @@ def auto_switch_slot(slot_id: int) -> None:
 
 # ── 健康监控 ──────────────────────────────────────────────────────────
 def _verify_slot_tunnel(slot_id: int) -> bool:
-    proxy_port = SLOTS[slot_id]["proxy_port"]
-    for url in [
-        "https://ipinfo.io/json",
-        "http://connectivitycheck.gstatic.com/generate_204",
-    ]:
-        try:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{proxy_port}",
-                                             "http":  f"http://127.0.0.1:{proxy_port}"}))
-            with opener.open(url, timeout=10) as r:
-                if r.status in (200, 204): return True
-        except Exception:
-            pass
-    return False
+    """用 tun IP 直连 ipinfo.io 验证隧道是否通畅"""
+    import socket as _socket, ssl
+    SO_MARK = 36
+    tun_ip = slot_states[slot_id].tun_ip
+    table  = SLOTS[slot_id]["table"]
+    try:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.settimeout(10)
+        if tun_ip:
+            try:
+                sock.setsockopt(_socket.SOL_SOCKET, SO_MARK, table)
+                sock.bind((tun_ip, 0))
+            except Exception:
+                pass
+        sock.connect(("ipinfo.io", 443))
+        ctx = ssl.create_default_context()
+        ssock = ctx.wrap_socket(sock, server_hostname="ipinfo.io")
+        ssock.sendall(b"GET /json HTTP/1.1\r\nHost: ipinfo.io\r\nConnection: close\r\n\r\n")
+        data = ssock.recv(256)
+        ssock.close()
+        return b"200" in data
+    except Exception:
+        return False
 
 def health_monitor() -> None:
     fail_counts = {0: 0, 1: 0}
