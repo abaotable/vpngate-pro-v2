@@ -51,38 +51,47 @@ def _save_ip_cache(cache: dict) -> None:
     except Exception:
         pass
 
-def _classify_from_batch(item: dict) -> tuple[str, str]:
-    if item.get("mobile"):
-        return "residential", "移动网络"
-    if item.get("proxy"):
-        return "proxy", "代理/VPN"
-    if item.get("hosting"):
-        return "datacenter", "机房IP"
-    org = (item.get("org") or "").lower()
-    isp = (item.get("isp") or "").lower()
-    DC_KEYWORDS = [
-        "softether", "vpngate", "cloud", "hosting", "host ", "server",
-        "datacenter", "data center", "vps", "virtual", "dedicated",
-        "coloc", "cdn", "idc", "amazon", "google", "microsoft", "azure",
-        "alibaba", "tencent", "oracle", "linode", "digitalocean", "vultr",
-        "ovh", "hetzner", "leaseweb", "choopa", "quadranet", "cogent",
-        "hurricane", "ntt ", "sakura", "conoha", "kagoya", "xserver",
-        "ablenet", "gmo internet", "softlayer", "rackspace", "psychz",
-        "backbone", "telecom research", "research institute",
-    ]
-    combined = org + " " + isp
+def _query_ipinfo(ip: str, timeout: float = 8.0) -> dict:
+    """查询 ipinfo.io 获取 IP 信息（免费，无需 key，50k次/月）"""
+    try:
+        req = urllib.request.Request(
+            f"https://ipinfo.io/{ip}/json",
+            headers={"User-Agent": "vpngate-pro/1.0", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+def _classify_from_ipinfo(data: dict) -> tuple[str, str]:
+    """
+    根据 ipinfo.io 返回字段判断 IP 类型。
+    ipinfo.io 免费版没有 hosting/proxy 字段，用 org 字段判断。
+    """
+    org = (data.get("org") or "").lower()
+    # org 格式：AS12345 ISP Name
+    org_name = re.sub(r"^as\d+\s*", "", org).strip()
     for kw in DC_KEYWORDS:
-        if kw in combined:
+        if kw in org_name:
             return "datacenter", "机房IP"
-    def _normalize(s: str) -> str:
-        return re.sub(r"\b(corporation|corp|inc|ltd|llc|co\.|gmbh|s\.a\.|plc|ab)\b", "", s).strip()
-    org_n = _normalize(org)
-    isp_n = _normalize(isp)
-    if org_n and isp_n and (org_n in isp_n or isp_n in org_n):
-        return "residential", "住宅IP"
     return "residential", "住宅IP"
 
-def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 15.0) -> None:
+DC_KEYWORDS = [
+    "softether", "vpngate", "cloud", "hosting", "host ", "server",
+    "datacenter", "data center", "vps", "virtual", "dedicated",
+    "coloc", "cdn", "idc", "amazon", "google", "microsoft", "azure",
+    "alibaba", "tencent", "oracle", "linode", "digitalocean", "vultr",
+    "ovh", "hetzner", "leaseweb", "choopa", "quadranet", "cogent",
+    "hurricane", "ntt ", "sakura", "conoha", "kagoya", "xserver",
+    "ablenet", "gmo internet", "softlayer", "rackspace", "psychz",
+    "backbone", "telecom research", "research institute",
+]
+
+def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 8.0) -> None:
+    """
+    查询节点 IP 的地理位置和类型信息，使用 ipinfo.io。
+    带本地缓存（7天有效期）。
+    """
     now = time.time()
     CACHE_TTL = 7 * 24 * 3600
     with _ip_cache_lock:
@@ -91,8 +100,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 15.0) -> None:
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host") or ""
         if not ip:
-            _set_unknown(node)
-            continue
+            _set_unknown(node); continue
         if ip in cache and now - cache[ip].get("cached_at", 0) < CACHE_TTL:
             _apply_cache(node, cache[ip])
         else:
@@ -101,43 +109,32 @@ def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 15.0) -> None:
     if not ips_to_query:
         return
     new_entries: dict[str, dict] = {}
-    chunk_size = 100
-    for i in range(0, len(ips_to_query), chunk_size):
-        chunk = ips_to_query[i:i + chunk_size]
-        payload = json.dumps(chunk).encode("utf-8")
-        req = urllib.request.Request(
-            "http://ip-api.com/batch?lang=zh-CN&fields=status,query,country,countryCode,regionName,city,isp,org,as,asname,proxy,hosting,mobile",
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "vpngate-pro/1.0"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            for item in data:
-                if item.get("status") != "success":
-                    continue
-                query_ip = item.get("query", "")
-                if not query_ip:
-                    continue
-                ip_type, quality = _classify_from_batch(item)
-                country_en = item.get("country", "")
-                country_zh = COUNTRY_TRANSLATIONS.get(country_en, country_en)
-                loc_parts = [item.get("city", ""), item.get("regionName", "")]
-                location = " ".join(p for p in loc_parts if p)
-                entry = {
-                    "owner":      item.get("org") or item.get("isp") or "",
-                    "asn":        item.get("as") or "",
-                    "as_name":    item.get("asname") or "",
-                    "location":   location,
-                    "country_zh": country_zh,
-                    "ip_type":    ip_type,
-                    "quality":    quality,
-                    "cached_at":  now,
-                }
-                new_entries[query_ip] = entry
-        except Exception as e:
-            print(f"[enrich_ip_info] 批量查询失败: {e}", flush=True)
+    for ip in ips_to_query:
+        data = _query_ipinfo(ip, timeout)
+        if not data or data.get("bogon"):
+            continue
+        org_raw   = data.get("org", "")       # "AS2516 KDDI CORPORATION"
+        asn       = org_raw.split()[0] if org_raw else ""
+        org_name  = " ".join(org_raw.split()[1:]) if org_raw else ""
+        country_code = data.get("country", "")
+        country_en   = data.get("country", "")
+        country_zh   = COUNTRY_TRANSLATIONS.get(country_en, country_en)
+        city     = data.get("city", "")
+        region   = data.get("region", "")
+        location = " ".join(p for p in [city, region] if p)
+        ip_type, quality = _classify_from_ipinfo(data)
+        entry = {
+            "owner":      org_name,
+            "asn":        asn,
+            "as_name":    org_name,
+            "location":   location,
+            "country_zh": country_zh,
+            "ip_type":    ip_type,
+            "quality":    quality,
+            "cached_at":  now,
+        }
+        new_entries[ip] = entry
+        time.sleep(0.1)  # ipinfo.io 免费版限速
     if new_entries:
         with _ip_cache_lock:
             cache = _load_ip_cache()
