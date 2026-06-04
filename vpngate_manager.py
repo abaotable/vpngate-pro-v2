@@ -134,18 +134,36 @@ def save_slot_configs(configs: dict[str, Any]) -> None:
     write_json(SLOT_CONFIG_FILE, configs)
 
 # ── xray出口配置 ─────────────────────────────────────────────────────
-XRAY_INBOUND_TAGS = {
-    "reality-vision": "VLESS-Reality (:25476)",
-    "vmess-xr":       "VMess-WS (:6123)",
-    "socks5-xr":      "SOCKS5 (:42447)",
-}
-DEFAULT_XRAY_DISPATCH = {tag: "direct" for tag in XRAY_INBOUND_TAGS}
+def read_xray_inbounds() -> list[dict]:
+    """
+    从 xr.json 读取所有 inbound 配置，返回列表。
+    每项包含：tag、protocol、port
+    不依赖硬编码，argosbx 换 UUID/端口后自动适配。
+    """
+    if not XRAY_CFG.exists():
+        return []
+    try:
+        cfg = json.loads(XRAY_CFG.read_text(encoding="utf-8"))
+        result = []
+        for ib in cfg.get("inbounds", []):
+            tag      = ib.get("tag", "")
+            protocol = ib.get("protocol", ib.get("type", ""))
+            port     = ib.get("port", ib.get("listen_port", 0))
+            if tag:
+                result.append({
+                    "tag":      tag,
+                    "protocol": protocol,
+                    "port":     port,
+                    "label":    f"{protocol.upper()} :{port}" if port else protocol.upper(),
+                })
+        return result
+    except Exception as e:
+        log("WARNING", "xray", f"读取 xr.json 失败: {e}")
+        return []
 
 def load_xray_dispatch() -> dict[str, str]:
-    data = read_json(XRAY_DISPATCH_FILE, {})
-    result = dict(DEFAULT_XRAY_DISPATCH)
-    result.update(data)
-    return result
+    """读取已保存的 xray 调度配置，值为 direct/slot0/slot1"""
+    return read_json(XRAY_DISPATCH_FILE, {})
 
 def save_xray_dispatch(cfg: dict[str, str]) -> None:
     write_json(XRAY_DISPATCH_FILE, cfg)
@@ -1137,11 +1155,6 @@ let SESSION = localStorage.getItem('vpn_session') || '';
 let allNodes = [], slotConfigs = {};
 let currentPage = 1, filteredNodes = [];
 
-const XRAY_TAGS = {
-  'reality-vision': 'VLESS-Reality (:25476)',
-  'vmess-xr':       'VMess-WS (:6123)',
-  'socks5-xr':      'SOCKS5 (:42447)',
-};
 const SOURCE_LABELS = {
   'vpngate_residential':'🏘 VPNGate 住宅IP',
   'vpngate_datacenter':'🏢 VPNGate 机房IP',
@@ -1607,32 +1620,46 @@ async function saveSlotConfigs() {
 async function loadXrayDispatch() {
   const r = await api('/api/dispatch');
   if (!r) return;
-  const cfg = r.config||{};
+  const cfg      = r.config   || {};
+  const inbounds = r.inbounds || [];
   const wrap = document.getElementById('xrayRoutingCards');
   wrap.innerHTML = '';
-  for (const [tag, label] of Object.entries(XRAY_TAGS)) {
-    const cur = cfg[tag]||'direct';
+  if (!inbounds.length) {
+    wrap.innerHTML = '<div style="color:#718096;font-size:13px;padding:12px">'
+      + '未检测到 xray inbound 配置，请确认 /root/agsbx/xr.json 存在。</div>';
+    return;
+  }
+  inbounds.forEach(ib => {
+    const cur = cfg[ib.tag] || 'direct';
     const div = document.createElement('div');
     div.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #2d3748';
     div.innerHTML = `
-      <span style="width:220px;font-size:13px">${label}</span>
-      <select class="select" id="xray-${tag}" style="width:180px">
+      <span style="width:240px;font-size:13px">
+        ${ib.label}
+        <span style="font-size:10px;color:#4a5568;display:block">${ib.tag}</span>
+      </span>
+      <select class="select" id="xray-${ib.tag}" style="width:180px">
         <option value="direct" ${cur==='direct'?'selected':''}>直连（VPS原IP）</option>
-        <option value="slot0" ${cur==='slot0'?'selected':''}>槽1（:7920）</option>
-        <option value="slot1" ${cur==='slot1'?'selected':''}>槽2（:7921）</option>
+        <option value="slot0"  ${cur==='slot0' ?'selected':''}>槽1（:7920）</option>
+        <option value="slot1"  ${cur==='slot1' ?'selected':''}>槽2（:7921）</option>
       </select>`;
     wrap.appendChild(div);
-  }
+  });
+  // 记录当前 inbound tag 列表供保存使用
+  wrap.dataset.tags = JSON.stringify(inbounds.map(ib => ib.tag));
 }
 
 async function saveXrayDispatch() {
+  const wrap = document.getElementById('xrayRoutingCards');
+  const tags = JSON.parse(wrap.dataset.tags || '[]');
+  if (!tags.length) return showToast('没有可配置的 inbound', true);
   const cfg = {};
-  for (const tag of Object.keys(XRAY_TAGS)) {
+  tags.forEach(tag => {
     const el = document.getElementById(`xray-${tag}`);
     if (el) cfg[tag] = el.value;
-  }
+  });
   const r = await api('/api/dispatch', {method:'POST', body:JSON.stringify({config:cfg})});
-  showToast(r&&r.ok?'已保存并热重载 xray':'保存失败', !(r&&r.ok));
+  showToast(r&&r.ok?'已保存并重启 xray':'保存失败', !(r&&r.ok));
 }
 
 // ── 节点操作 ──
@@ -1766,13 +1793,16 @@ class WebHandler(BaseHTTPRequestHandler):
         if not self._check_session():
             self._send_json({"error": "未授权"}, 401); return
         path_map = {
-            "/api/status":      self._handle_status,
-            "/api/nodes":       lambda: self._send_json({"nodes": read_json(NODES_FILE, [])}),
-            "/api/custom_nodes":lambda: self._send_json({"nodes": read_json(CUSTOM_NODES_FILE, [])}),
-            "/api/slot_configs":lambda: self._send_json({"configs": load_slot_configs()}),
-            "/api/dispatch":    lambda: self._send_json({"config": load_xray_dispatch()}),
-            "/api/logs":        self._handle_logs,
-            "/api/ui_config":   lambda: self._send_json({"port": load_ui_config().get("port", 8787)}),
+            "/api/status":        self._handle_status,
+            "/api/nodes":         lambda: self._send_json({"nodes": read_json(NODES_FILE, [])}),
+            "/api/custom_nodes":  lambda: self._send_json({"nodes": read_json(CUSTOM_NODES_FILE, [])}),
+            "/api/slot_configs":  lambda: self._send_json({"configs": load_slot_configs()}),
+            "/api/dispatch":      lambda: self._send_json({
+                                      "config": load_xray_dispatch(),
+                                      "inbounds": read_xray_inbounds(),
+                                  }),
+            "/api/logs":          self._handle_logs,
+            "/api/ui_config":     lambda: self._send_json({"port": load_ui_config().get("port", 8787)}),
         }
         handler = path_map.get(path)
         if handler: handler()
