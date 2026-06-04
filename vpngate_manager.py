@@ -73,7 +73,7 @@ def xray_watchdog() -> None:
             _restart_xray()
 
 OPENVPN_CMD       = os.environ.get("OPENVPN_CMD", "openvpn")
-MAX_SCAN_ROWS     = 300
+MAX_SCAN_ROWS     = 5000   # VPNGate API 返回几千行，全部扫描
 MAX_CONCURRENT_TESTS = 6
 OPENVPN_TIMEOUT   = 35
 
@@ -887,7 +887,7 @@ def refresh_nodes_loop() -> None:
                 seen.add(c["id"])
             for nid, n in existing.items():
                 if nid not in seen: merged.append(n)
-            write_json(NODES_FILE, sort_nodes(merged[:1000]))
+            write_json(NODES_FILE, sort_nodes(merged[:5000]))
             log("INFO", "Refresh", f"节点刷新完成，共 {len(merged)} 个")
         except Exception as e:
             log("ERROR", "Refresh", str(e))
@@ -1903,7 +1903,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     seen.add(c["id"])
                 for nid, n in existing.items():
                     if nid not in seen: merged.append(n)
-                write_json(NODES_FILE, sort_nodes(merged[:1000]))
+                write_json(NODES_FILE, sort_nodes(merged[:5000]))
             except Exception as e:
                 log("ERROR", "Fetch", str(e))
         threading.Thread(target=do, daemon=True).start()
@@ -2037,7 +2037,7 @@ def main():
                 merged.append(existing.get(c["id"], c)); seen.add(c["id"])
             for nid, n in existing.items():
                 if nid not in seen: merged.append(n)
-            write_json(NODES_FILE, sort_nodes(merged[:1000]))
+            write_json(NODES_FILE, sort_nodes(merged[:5000]))
             to_test = [n for n in merged
                        if n.get("probe_status") == "not_checked"
                        and n.get("proto", "tcp") == "tcp"][:6]
