@@ -323,28 +323,38 @@ def fetch_candidates() -> list[dict[str, Any]]:
         if not ip or ip in seen_ips:
             continue
         encoded = row.get("OpenVPN_ConfigData_Base64", "").strip()
-        if not encoded:
-            continue
-        try:
-            config_text = base64.b64decode(encoded.encode(), validate=False).decode("utf-8", errors="replace")
-        except Exception:
-            continue
+        has_config = bool(encoded)
+        config_text = ""
+        if has_config:
+            try:
+                config_text = base64.b64decode(encoded.encode(), validate=False).decode("utf-8", errors="replace")
+            except Exception:
+                has_config = False
+
         country_long  = row.get("CountryLong", "")
         country_short = row.get("CountryShort", "")
         country_zh    = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long)
-        remote_host, remote_port, proto = vpn_utils.parse_remote(config_text, ip)
+        remote_host, remote_port, proto = (
+            vpn_utils.parse_remote(config_text, ip) if has_config
+            else (ip, 1194, "tcp")
+        )
         node_id = safe_name("_".join([country_short or "XX", ip, str(remote_port), proto]))
         config_path = CONFIG_DIR / f"{node_id}.ovpn"
+
         candidates.append({
             "id": node_id, "node_type": "vpngate",
             "country": country_zh, "country_short": country_short, "country_zh": country_zh,
             "host_name": row.get("HostName", ""), "ip": ip,
             "score": parse_int(row.get("Score")), "ping": parse_int(row.get("Ping")),
             "speed": parse_int(row.get("Speed")),
-            "config_file": str(config_path), "config_text": config_text,
+            "config_file": str(config_path),
+            "config_text": config_text,
+            "has_config":  has_config,   # False = 无 OpenVPN 配置，不可直连
             "proto": proto, "remote_host": remote_host, "remote_port": remote_port,
-            "fetched_at": time.time(), "probe_status": "not_checked",
-            "probe_message": "", "probed_at": 0, "latency_ms": 0,
+            "fetched_at": time.time(),
+            "probe_status": "not_checked" if has_config else "no_config",
+            "probe_message": "" if has_config else "无 OpenVPN 配置",
+            "probed_at": 0, "latency_ms": 0,
             "owner": "", "asn": "", "as_name": "", "location": "",
             "ip_type": "unknown", "quality": "未知", "active_slot": -1,
         })
@@ -354,11 +364,13 @@ def fetch_candidates() -> list[dict[str, Any]]:
 
 def sort_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def key(n):
+        st = n.get("probe_status", "")
         proto_score = 0 if n.get("proto", "tcp") == "tcp" else 1
         lat = parse_int(n.get("latency_ms")) or 999999
-        return (0 if n.get("probe_status") == "available" else
-                1 if n.get("probe_status") == "not_checked" else 2,
-                proto_score, lat, -parse_int(n.get("score")))
+        order = (0 if st == "available" else
+                 1 if st == "not_checked" else
+                 2 if st == "unavailable" else 3)  # no_config 排最后
+        return (order, proto_score, lat, -parse_int(n.get("score")))
     return sorted(nodes, key=key)
 
 # ── OpenVPN ──────────────────────────────────────────────────────────
@@ -509,6 +521,8 @@ def _free_test_tun(idx: int) -> None:
         _test_tuns.discard(idx)
 
 def test_node_sync(node: dict[str, Any]) -> dict[str, Any]:
+    if not node.get("has_config", True) or not node.get("config_text"):
+        return {"probe_status": "no_config", "probe_message": "无 OpenVPN 配置"}
     config_path = Path(node["config_file"])
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
     config_path.write_text(node.get("config_text", ""), encoding="utf-8")
@@ -687,19 +701,24 @@ def connect_custom_socks5(slot_id: int, node: dict) -> str:
 
 def check_slot_proxy(slot_id: int) -> dict[str, Any]:
     proxy_port = SLOTS[slot_id]["proxy_port"]
-    try:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({
-                "http":  f"http://127.0.0.1:{proxy_port}",
-                "https": f"http://127.0.0.1:{proxy_port}",
-            }))
-        t0 = time.time()
-        with opener.open("http://208.95.112.1/json/?fields=query,country,org", timeout=12) as resp:
-            data = json.loads(resp.read())
-        return {"ok": True, "ip": data.get("query", ""),
-                "latency_ms": int((time.time()-t0)*1000)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    for url in [
+        "https://ipinfo.io/json",
+        "https://api.ipify.org?format=json",
+    ]:
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({
+                    "http":  f"http://127.0.0.1:{proxy_port}",
+                    "https": f"http://127.0.0.1:{proxy_port}",
+                }))
+            t0 = time.time()
+            with opener.open(url, timeout=12) as resp:
+                data = json.loads(resp.read())
+            ip = data.get("ip") or data.get("query", "")
+            return {"ok": True, "ip": ip, "latency_ms": int((time.time()-t0)*1000)}
+        except Exception:
+            continue
+    return {"ok": False, "error": "出口检测失败"}
 
 # ── 自动切换（主备节点逻辑） ──────────────────────────────────────────
 def _get_node_by_id(node_id: str) -> dict | None:
@@ -762,6 +781,7 @@ def auto_switch_slot(slot_id: int) -> None:
     for src in sources:
         cands = [n for n in vpngate_nodes
                  if n.get("probe_status") == "available"
+                 and n.get("has_config", True)
                  and n["id"] != other_node]
         if src == "vpngate_residential":
             cands = [n for n in cands if n.get("ip_type") == "residential"]
@@ -793,11 +813,14 @@ def auto_switch_slot(slot_id: int) -> None:
 # ── 健康监控 ──────────────────────────────────────────────────────────
 def _verify_slot_tunnel(slot_id: int) -> bool:
     proxy_port = SLOTS[slot_id]["proxy_port"]
-    for url in ["http://connectivitycheck.gstatic.com/generate_204",
-                "http://208.95.112.1/json/?fields=query"]:
+    for url in [
+        "https://ipinfo.io/json",
+        "http://connectivitycheck.gstatic.com/generate_204",
+    ]:
         try:
             opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{proxy_port}"}))
+                urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{proxy_port}",
+                                             "http":  f"http://127.0.0.1:{proxy_port}"}))
             with opener.open(url, timeout=10) as r:
                 if r.status in (200, 204): return True
         except Exception:
@@ -870,7 +893,7 @@ def health_monitor() -> None:
 
 def refresh_nodes_loop() -> None:
     while True:
-        time.sleep(960)
+        time.sleep(300)  # 每5分钟刷新一次，加快节点积累
         try:
             candidates = fetch_candidates()
             with lock:
@@ -1052,7 +1075,7 @@ tr:hover td{background:#141720}
         <div class="filter-group"><label>状态</label>
           <select class="select" id="flStatus" onchange="gotoPage(1)">
             <option value="">全部</option><option value="available">可用</option>
-            <option value="not_checked">未测试</option><option value="unavailable">不可用</option>
+            <option value="not_checked">未测试</option><option value="unavailable">不可用</option><option value="no_config">无配置</option>
           </select>
         </div>
         <div class="filter-group"><label>国家</label>
@@ -1293,7 +1316,7 @@ function renderNodePage(nodes, totalPages, pageSize) {
   tbody.innerHTML = '';
   const IP_TYPE_MAP = {residential:['住宅','residential'],datacenter:['机房','datacenter'],
     proxy:['代理','proxy'],unknown:['未知','unknown'],mobile:['移动','residential']};
-  const ST_MAP = {available:['可用','available'],unavailable:['不可用','unavail'],not_checked:['未测试','notcheck']};
+  const ST_MAP = {available:['可用','available'],unavailable:['不可用','unavail'],not_checked:['未测试','notcheck'],no_config:['无配置','notcheck']};
   nodes.forEach(n=>{
     const geo = [n.country, n.location].filter(Boolean).join(' · ');
     const [itLabel, itClass] = IP_TYPE_MAP[n.ip_type]||['未知','unknown'];
