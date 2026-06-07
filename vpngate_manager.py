@@ -397,7 +397,8 @@ def build_openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
            "--route-delay", "2", "--connect-retry-max", "1",
            "--connect-timeout", "15",
            "--auth-user-pass", str(AUTH_FILE), "--auth-nocache",
-           "--route-nopull"]
+           "--route-nopull",
+           "--tls-cert-profile", "insecure"]  # VPNGate用Let's Encrypt证书，跳过内嵌CA验证
     ver = get_openvpn_version()
     if ver >= 2.5:
         cmd += ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"]
@@ -2141,7 +2142,7 @@ def main():
     import threading as _threading
     from concurrent.futures import ThreadPoolExecutor
 
-    # 线程栈从默认 8MB 降到 1MB
+    # 线程栈从默认 8MB 降到 512KB
     _threading.stack_size(1048576)
 
     # 让 malloc 更积极地归还内存给 OS
