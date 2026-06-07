@@ -2134,3 +2134,101 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ── 覆盖 main 函数（内存优化版） ──────────────────────────────────────
+def main():
+    import gc
+    import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    # 线程栈从默认 8MB 降到 1MB
+    _threading.stack_size(1048576)
+
+    # 让 malloc 更积极地归还内存给 OS
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        libc.mallopt(-3, 65536)   # M_MMAP_THRESHOLD = 64KB
+        libc.mallopt(-1, 131072)  # M_TRIM_THRESHOLD = 128KB
+    except Exception:
+        pass
+
+    ensure_dirs()
+    log("INFO", "Main", "VPNGate Pro 启动（内存优化版）")
+    try:
+        subprocess.run(["iptables", "-t", "nat", "-F", "OUTPUT"], capture_output=True)
+    except Exception:
+        pass
+
+    proxy_mod.start_proxy_servers()
+
+    dispatch_cfg = load_xray_dispatch()
+    if any(v != "direct" for v in dispatch_cfg.values()):
+        threading.Thread(target=apply_xray_dispatch, args=(dispatch_cfg,), daemon=True).start()
+
+    def startup_fetch():
+        try:
+            candidates = fetch_candidates()
+            existing = {n["id"]: n for n in read_json(NODES_FILE, [])}
+            merged, seen = [], set()
+            for c in candidates:
+                merged.append(existing.get(c["id"], c)); seen.add(c["id"])
+            for nid, n in existing.items():
+                if nid not in seen: merged.append(n)
+            write_json(NODES_FILE, sort_nodes(merged[:5000]))
+            gc.collect()
+            to_test = [n for n in merged
+                       if n.get("probe_status") == "not_checked"
+                       and n.get("has_config", True)
+                       and n.get("proto", "tcp") == "tcp"][:6]
+            if to_test:
+                batch_test_nodes([n["id"] for n in to_test])
+            gc.collect()
+        except Exception as e:
+            log("ERROR", "Startup", str(e))
+
+    def gc_loop():
+        """每5分钟强制 GC 并归还堆内存给 OS"""
+        while True:
+            time.sleep(300)
+            gc.collect()
+            try:
+                import ctypes, ctypes.util
+                libc = ctypes.CDLL(ctypes.util.find_library("c"))
+                libc.malloc_trim(0)
+            except Exception:
+                pass
+
+    threading.Thread(target=startup_fetch, daemon=True).start()
+    threading.Thread(target=health_monitor, daemon=True).start()
+    threading.Thread(target=refresh_nodes_loop, daemon=True).start()
+    threading.Thread(target=xray_watchdog, daemon=True).start()
+    threading.Thread(target=gc_loop, daemon=True).start()
+
+    cfg  = load_ui_config()
+    host = cfg.get("host", "0.0.0.0")
+    port = int(cfg.get("port", 8787))
+
+    # 线程池 HTTP 服务器，最多 20 个并发请求
+    class PooledHTTPServer(ThreadingHTTPServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._pool = ThreadPoolExecutor(max_workers=20)
+        def process_request(self, request, client_address):
+            self._pool.submit(self._handle, request, client_address)
+        def _handle(self, request, client_address):
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
+
+    server = PooledHTTPServer((host, port), WebHandler)
+    log("INFO", "WebUI", f"地址: http://{host}:{port}/  用户名: {cfg['username']}  密码: {cfg['password']}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("INFO", "Main", "退出...")
+        for sid in range(2): stop_slot(sid)
+        proxy_mod.stop_proxy_servers()
