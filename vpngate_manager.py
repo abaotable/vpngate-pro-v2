@@ -389,6 +389,11 @@ def get_openvpn_version() -> float:
         pass
     _openvpn_ver = 2.4; return _openvpn_ver
 
+def strip_ca_block(config_text: str) -> str:
+    """移除 OpenVPN 配置中内嵌的 <ca>...</ca> 块，改用系统 CA 证书库"""
+    import re as _re
+    return _re.sub(r'<ca>.*?</ca>', '', config_text, flags=_re.DOTALL).strip()
+
 def build_openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
     cmd = [OPENVPN_CMD, "--config", config_file,
            "--dev", tun_dev, "--dev-type", "tun",
@@ -398,7 +403,8 @@ def build_openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
            "--connect-timeout", "15",
            "--auth-user-pass", str(AUTH_FILE), "--auth-nocache",
            "--route-nopull",
-           "--tls-cert-profile", "insecure"]  # VPNGate用Let's Encrypt证书，跳过内嵌CA验证
+           "--capath", "/etc/ssl/certs",   # 使用系统最新CA证书库
+           ]
     ver = get_openvpn_version()
     if ver >= 2.5:
         cmd += ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"]
@@ -526,7 +532,7 @@ def test_node_sync(node: dict[str, Any]) -> dict[str, Any]:
         return {"probe_status": "no_config", "probe_message": "无 OpenVPN 配置"}
     config_path = Path(node["config_file"])
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-    config_path.write_text(node.get("config_text", ""), encoding="utf-8")
+    config_path.write_text(strip_ca_block(node.get("config_text", "")), encoding="utf-8")
     proto = node.get("proto", "tcp")
     latency = vpn_utils.ping_latency_ms(
         node.get("remote_host") or node.get("ip"),
@@ -644,7 +650,7 @@ def connect_slot(slot_id: int, node_id: str) -> str:
         stop_slot(slot_id)
         config_path = Path(node["config_file"])
         CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-        config_path.write_text(node.get("config_text", ""), encoding="utf-8")
+        config_path.write_text(strip_ca_block(node.get("config_text", "")), encoding="utf-8")
         st.status_msg = "启动 OpenVPN..."
         ok, msg, proc = run_openvpn(str(config_path), slot_cfg["tun"], keep_alive=True)
         if not ok or proc is None:
