@@ -818,7 +818,7 @@ def auto_switch_slot(slot_id: int) -> None:
         stop_slot(slot_id)
         return
 
-    # ── 无主节点，自动从 node_sources 选择 ──
+    # ── 无主节点，自动从 node_sources 选择，依次尝试直到成功 ──
     other_node = slot_states[1 - slot_id].node_id
     sources = slot_cfg.get("node_sources", ["vpngate_any"])
     countries = slot_cfg.get("countries", [])
@@ -848,15 +848,22 @@ def auto_switch_slot(slot_id: int) -> None:
             candidates = cands; break
 
     if not candidates:
-        log("ERROR", f"Slot{slot_id}", "没有可用节点")
+        log("ERROR", f"Slot{slot_id}", "没有可用节点，停止槽")
         stop_slot(slot_id); return
 
-    target = candidates[0]
-    log("INFO", f"Slot{slot_id}", f"自动切换 → {target['id']}")
-    try:
-        connect_slot(slot_id, target["id"])
-    except Exception as e:
-        log("ERROR", f"Slot{slot_id}", f"自动切换失败: {e}")
+    # 依次尝试候选节点，最多尝试5个
+    max_attempts = min(5, len(candidates))
+    for i, target in enumerate(candidates[:max_attempts]):
+        log("INFO", f"Slot{slot_id}",
+            f"自动切换尝试 {i+1}/{max_attempts} → {target['id']}")
+        if _try_connect_node(slot_id, target["id"]):
+            st.using_backup = False
+            log("INFO", f"Slot{slot_id}", f"自动切换成功: {target['id']}")
+            return
+        log("WARNING", f"Slot{slot_id}", f"节点 {target['id']} 连接失败，尝试下一个")
+
+    log("ERROR", f"Slot{slot_id}", f"尝试 {max_attempts} 个节点均失败，停止槽")
+    stop_slot(slot_id)
 
 # ── 健康监控 ──────────────────────────────────────────────────────────
 def _verify_slot_tunnel(slot_id: int) -> bool:
@@ -948,11 +955,32 @@ def health_monitor() -> None:
                         log("ERROR", f"Slot{sid}", f"切换回主节点失败: {e}")
             threading.Thread(target=_check_primary, daemon=True).start()
 
+def periodic_retest_loop() -> None:
+    """每24小时重新测试一批 available 节点（按最久未测排序）"""
+    time.sleep(3600)  # 启动1小时后开始
+    while True:
+        try:
+            nodes = read_json(NODES_FILE, [])
+            to_retest = sorted(
+                [n for n in nodes
+                 if n.get("probe_status") == "available"
+                 and n.get("has_config", True)],
+                key=lambda n: n.get("probed_at", 0)
+            )[:20]
+            if to_retest:
+                log("INFO", "Retest", f"定期重测 {len(to_retest)} 个 available 节点")
+                batch_test_nodes([n["id"] for n in to_retest])
+        except Exception as e:
+            log("ERROR", "Retest", str(e))
+        time.sleep(24 * 3600)
+
 def refresh_nodes_loop() -> None:
     while True:
-        time.sleep(300)  # 每5分钟刷新一次，加快节点积累
+        time.sleep(300)
         try:
             candidates = fetch_candidates()
+            now = time.time()
+            cutoff_7d = now - 7 * 24 * 3600
             with lock:
                 existing = {n["id"]: n for n in read_json(NODES_FILE, [])}
             merged, seen = [], set()
@@ -960,15 +988,39 @@ def refresh_nodes_loop() -> None:
                 if c["id"] in existing:
                     ex = existing[c["id"]]
                     ex["config_text"] = c["config_text"]
-                    ex["fetched_at"]  = c["fetched_at"]
+                    ex["fetched_at"]  = now  # 更新最后出现时间
                     merged.append(ex)
                 else:
                     merged.append(c)
                 seen.add(c["id"])
             for nid, n in existing.items():
                 if nid not in seen: merged.append(n)
+
+            # ── 清理超过7天未出现且状态为 unavailable/not_checked 的节点 ──
+            before = len(merged)
+            merged = [n for n in merged if not (
+                n.get("fetched_at", 0) < cutoff_7d
+                and n.get("probe_status") in ("unavailable", "not_checked", "no_config")
+            )]
+            cleaned = before - len(merged)
+            if cleaned > 0:
+                log("INFO", "Refresh", f"清理过期节点 {cleaned} 个")
+
             write_json(NODES_FILE, sort_nodes(merged[:5000]))
             log("INFO", "Refresh", f"节点刷新完成，共 {len(merged)} 个")
+
+            # ── 自动测试新进入的有配置节点（每批最多10个）──
+            new_nodes = [n for n in merged
+                         if n.get("probe_status") == "not_checked"
+                         and n.get("has_config", True)
+                         and n.get("proto", "tcp") == "tcp"][:10]
+            if new_nodes:
+                log("INFO", "Refresh", f"自动测试 {len(new_nodes)} 个新节点")
+                threading.Thread(
+                    target=batch_test_nodes,
+                    args=([n["id"] for n in new_nodes],),
+                    daemon=True,
+                ).start()
         except Exception as e:
             log("ERROR", "Refresh", str(e))
 
@@ -1159,10 +1211,20 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f
     <div class="card">
       <div class="flex justify-between items-center">
         <h2>🗂 节点列表</h2>
-        <div class="flex gap-2">
+        <div class="flex gap-2" style="flex-wrap:wrap">
           <button class="btn btn-xs btn-grey" onclick="fetchNodes()">拉取</button>
           <button class="btn btn-xs btn-primary" id="testBtn" onclick="testCurrentPage()">测试当前页</button>
         </div>
+      </div>
+      <!-- 批量操作栏 -->
+      <div class="flex gap-2 mt-2" style="flex-wrap:wrap;align-items:center">
+        <button class="btn btn-xs btn-grey" onclick="toggleSelectAll()">全选当前页</button>
+        <button class="btn btn-xs btn-danger" id="deleteSelectedBtn" onclick="deleteSelected()" style="display:none">删除选中(<span id="selectedCount">0</span>)</button>
+        <div style="margin-left:8px;height:20px;border-left:1px solid #2d3748"></div>
+        <button class="btn btn-xs btn-danger" onclick="deleteByType('unavailable')">删除不可用</button>
+        <button class="btn btn-xs btn-grey" onclick="deleteByType('no_config')">删除无配置</button>
+        <button class="btn btn-xs btn-grey" onclick="deleteByType('not_checked')">删除未测试</button>
+        <button class="btn btn-xs btn-warning" onclick="deleteByType('all_inactive')">一键清理</button>
       </div>
       <!-- 进度条 -->
       <div class="progress-wrap" id="testProgress">
@@ -1204,6 +1266,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f
       <div style="overflow-x:auto">
         <table class="node-table">
           <thead><tr>
+            <th style="width:32px"><input type="checkbox" id="thCheck" onclick="toggleSelectAll(this.checked)"></th>
             <th>国家/地区</th><th>IP</th><th>协议</th><th>延迟</th>
             <th>IP类型</th><th>状态</th><th>归属</th><th>操作</th>
           </tr></thead>
@@ -1398,18 +1461,101 @@ function getNodeStatus(n){
   return ST_MAP[n.probe_status]||['未知','notcheck'];
 }
 
-function renderNodePage(nodes,totalPages,pageSize){
-  // 桌面端表格
-  const tbody=document.getElementById('nodeTableBody');
-  tbody.innerHTML='';
+let selectedNodeIds = new Set();
+
+function updateSelectedUI() {
+  const n = selectedNodeIds.size;
+  const btn = document.getElementById('deleteSelectedBtn');
+  const cnt = document.getElementById('selectedCount');
+  if (btn) { btn.style.display = n > 0 ? '' : 'none'; }
+  if (cnt) cnt.textContent = n;
+  // 同步表头checkbox状态
+  const th = document.getElementById('thCheck');
+  if (th) {
+    const ps = parseInt(document.getElementById('pageSize')?.value||'50');
+    const start = (currentPage-1)*ps;
+    const pageIds = filteredNodes.slice(start, start+ps).map(n=>n.id);
+    const allSel = pageIds.length > 0 && pageIds.every(id=>selectedNodeIds.has(id));
+    th.checked = allSel;
+    th.indeterminate = !allSel && pageIds.some(id=>selectedNodeIds.has(id));
+  }
+}
+
+function toggleNodeSelect(id, checked) {
+  if (checked) selectedNodeIds.add(id);
+  else selectedNodeIds.delete(id);
+  updateSelectedUI();
+}
+
+function toggleSelectAll(checked) {
+  const ps = parseInt(document.getElementById('pageSize')?.value||'50');
+  const start = (currentPage-1)*ps;
+  const pageNodes = filteredNodes.slice(start, start+ps);
+  // 如果传入checked参数（来自th checkbox），直接用；否则判断当前状态
+  const doSelect = checked !== undefined ? checked :
+    !pageNodes.every(n=>selectedNodeIds.has(n.id));
+  pageNodes.forEach(n => {
+    if (doSelect) selectedNodeIds.add(n.id);
+    else selectedNodeIds.delete(n.id);
+  });
+  // 同步行checkbox
+  pageNodes.forEach(n => {
+    const cb = document.getElementById('cb-'+n.id);
+    const cbm = document.getElementById('cbm-'+n.id);
+    if (cb) cb.checked = doSelect;
+    if (cbm) cbm.checked = doSelect;
+  });
+  updateSelectedUI();
+}
+
+async function deleteSelected() {
+  if (!selectedNodeIds.size) return;
+  if (!confirm(`确认删除选中的 ${selectedNodeIds.size} 个节点？`)) return;
+  const r = await api('/api/delete_nodes', {method:'POST', body:JSON.stringify({
+    criteria: 'ids', node_ids: [...selectedNodeIds]
+  })});
+  if (r&&r.ok) {
+    showToast(`已删除 ${r.deleted} 个节点，剩余 ${r.remaining} 个`);
+    selectedNodeIds.clear();
+    updateSelectedUI();
+    loadNodes();
+  } else showToast('删除失败', true);
+}
+
+async function deleteByType(criteria) {
+  const labels = {
+    unavailable:'不可用节点', no_config:'无配置节点',
+    not_checked:'未测试节点', all_inactive:'不可用+无配置+过期未测试节点'
+  };
+  if (!confirm(`确认删除所有${labels[criteria]||criteria}？`)) return;
+  const r = await api('/api/delete_nodes', {method:'POST', body:JSON.stringify({criteria})});
+  if (r&&r.ok) {
+    showToast(`已删除 ${r.deleted} 个，剩余 ${r.remaining} 个`);
+    loadNodes();
+  } else showToast('删除失败', true);
+}
+
+function renderNodePage(nodes, totalPages, pageSize) {
+  const tbody = document.getElementById('nodeTableBody');
+  tbody.innerHTML = '';
+  const cards = document.getElementById('nodeCards');
+  cards.innerHTML = '';
+  const IP_TYPE_MAP={residential:['住宅','residential'],datacenter:['机房','datacenter'],proxy:['代理','proxy'],unknown:['未知','unknown'],mobile:['移动','residential']};
+  const ST_MAP={available:['可用','available'],unavailable:['不可用','unavail'],not_checked:['未测试','notcheck'],no_config:['无配置','notcheck']};
+
   nodes.forEach(n=>{
     const geo=[n.country,n.location].filter(Boolean).join('·');
     const [itL,itC]=IP_TYPE_MAP[n.ip_type]||['未知','unknown'];
     const [stL,stC]=getNodeStatus(n);
     const proto=n.proto||'tcp';
+    const isSel = selectedNodeIds.has(n.id);
+
+    // 桌面端表格行
     const tr=document.createElement('tr');
     tr.id='tr-'+n.id;
+    if (isSel) tr.style.background='#1a2744';
     tr.innerHTML=`
+      <td><input type="checkbox" id="cb-${n.id}" ${isSel?'checked':''} onchange="toggleNodeSelect('${n.id}',this.checked)"></td>
       <td>${geo||'-'} <span style="font-size:10px;color:#4a5568">${n.country_short||''}</span></td>
       <td style="font-family:monospace;font-size:11px">${n.ip||'-'}</td>
       <td><span class="tag ${proto}">${proto.toUpperCase()}</span></td>
@@ -1423,22 +1569,17 @@ function renderNodePage(nodes,totalPages,pageSize){
         <button class="btn btn-xs btn-success" id="testbtn-${n.id}" onclick="testOneNode('${n.id}',this)">测</button>
       </td>`;
     tbody.appendChild(tr);
-  });
-  if(!nodes.length)tbody.innerHTML='<tr><td colspan="8" style="text-align:center;padding:20px;color:#718096">无数据</td></tr>';
 
-  // 移动端卡片
-  const cards=document.getElementById('nodeCards');
-  cards.innerHTML='';
-  nodes.forEach(n=>{
-    const geo=[n.country,n.location].filter(Boolean).join(' · ');
-    const [itL,itC]=IP_TYPE_MAP[n.ip_type]||['未知','unknown'];
-    const [stL,stC]=getNodeStatus(n);
-    const proto=n.proto||'tcp';
+    // 移动端卡片
     const div=document.createElement('div');
     div.className='node-card'; div.id='card-'+n.id;
+    if (isSel) div.style.borderColor='#63b3ed';
     div.innerHTML=`
       <div class="node-card-header">
-        <span style="font-weight:600;font-size:13px">${geo||n.ip||'-'}</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="cbm-${n.id}" ${isSel?'checked':''} onchange="toggleNodeSelect('${n.id}',this.checked)">
+          <span style="font-weight:600;font-size:13px">${geo||n.ip||'-'}</span>
+        </div>
         <span class="tag ${stC}" id="st-m-${n.id}">${stL}</span>
       </div>
       <div class="node-card-info">
@@ -1446,15 +1587,18 @@ function renderNodePage(nodes,totalPages,pageSize){
         <span class="tag ${proto}" style="font-size:10px">${proto.toUpperCase()}</span>
         <span class="tag ${itC}" style="font-size:10px">${itL}</span>
         ${n.latency_ms?`<span>${n.latency_ms}ms</span>`:''}
-        ${n.as_name?`<span style="color:#4a5568">${n.as_name.substring(0,20)}</span>`:''}
       </div>
       <div class="node-card-actions">
         <button class="btn btn-xs btn-primary" onclick="connectNode('${n.id}',0)">→槽1</button>
         <button class="btn btn-xs btn-grey" onclick="connectNode('${n.id}',1)">→槽2</button>
-        <button class="btn btn-xs btn-success" id="testbtn-m-${n.id}" onclick="testOneNode('${n.id}',this)">测试</button>
+        <button class="btn btn-xs btn-success" onclick="testOneNode('${n.id}',this)">测试</button>
       </div>`;
     cards.appendChild(div);
   });
+
+  if(!nodes.length){
+    tbody.innerHTML='<tr><td colspan="9" style="text-align:center;padding:20px;color:#718096">无数据</td></tr>';
+  }
 
   // 分页
   const pg=document.getElementById('pagination');
@@ -1472,6 +1616,7 @@ function renderNodePage(nodes,totalPages,pageSize){
     next.className='pg-btn';next.textContent='›';next.disabled=currentPage===totalPages;
     next.onclick=()=>gotoPage(currentPage+1);pg.appendChild(next);
   }
+  updateSelectedUI();
 }
 
 // ── 批量测试（带进度显示） ──
@@ -1912,6 +2057,7 @@ class WebHandler(BaseHTTPRequestHandler):
             "/api/slot_configs":        lambda: self._handle_save_slot_configs(body),
             "/api/dispatch":            lambda: self._handle_save_dispatch(body),
             "/api/update_credentials":  lambda: self._handle_update_credentials(body),
+            "/api/delete_nodes":        lambda: self._handle_delete_nodes(body),
         }
         handler = handlers.get(path)
         if handler: handler()
@@ -2068,6 +2214,35 @@ class WebHandler(BaseHTTPRequestHandler):
         WEB_SESSIONS.clear()
         self._send_json({"ok": True})
 
+    def _handle_delete_nodes(self, body: dict):
+        criteria = body.get("criteria", "")
+        node_ids = set(body.get("node_ids", []))
+        days     = int(body.get("days", 7))
+        cutoff   = time.time() - days * 24 * 3600
+        with lock:
+            nodes  = read_json(NODES_FILE, [])
+            before = len(nodes)
+            if criteria == "ids":
+                nodes = [n for n in nodes if n["id"] not in node_ids]
+            elif criteria == "unavailable":
+                nodes = [n for n in nodes if n.get("probe_status") != "unavailable"]
+            elif criteria == "no_config":
+                nodes = [n for n in nodes if n.get("probe_status") != "no_config"]
+            elif criteria == "not_checked":
+                nodes = [n for n in nodes if n.get("probe_status") != "not_checked"]
+            elif criteria == "stale":
+                nodes = [n for n in nodes if n.get("fetched_at", 0) >= cutoff]
+            elif criteria == "all_inactive":
+                nodes = [n for n in nodes if not (
+                    n.get("probe_status") == "unavailable" or
+                    n.get("probe_status") == "no_config" or
+                    (n.get("probe_status") == "not_checked" and n.get("fetched_at", 0) < cutoff)
+                )]
+            deleted = before - len(nodes)
+            write_json(NODES_FILE, sort_nodes(nodes))
+        log("INFO", "Nodes", f"批量删除 {deleted} 个，剩余 {len(nodes)} 个")
+        self._send_json({"ok": True, "deleted": deleted, "remaining": len(nodes)})
+
     def _handle_logs(self):
         logs = []
         lf = LOGS_DIR / f"{time.strftime('%Y-%m-%d')}.json"
@@ -2211,6 +2386,7 @@ def main():
     threading.Thread(target=refresh_nodes_loop, daemon=True).start()
     threading.Thread(target=xray_watchdog, daemon=True).start()
     threading.Thread(target=gc_loop, daemon=True).start()
+    threading.Thread(target=periodic_retest_loop, daemon=True).start()
 
     cfg  = load_ui_config()
     host = cfg.get("host", "0.0.0.0")
