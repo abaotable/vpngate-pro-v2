@@ -1006,7 +1006,7 @@ def refresh_nodes_loop() -> None:
             if cleaned > 0:
                 log("INFO", "Refresh", f"清理过期节点 {cleaned} 个")
 
-            write_json(NODES_FILE, sort_nodes(merged[:5000]))
+            write_json(NODES_FILE, sort_nodes(merged[:300]))
             log("INFO", "Refresh", f"节点刷新完成，共 {len(merged)} 个")
 
             # ── 自动测试新进入的有配置节点（每批最多10个）──
@@ -2125,7 +2125,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     seen.add(c["id"])
                 for nid, n in existing.items():
                     if nid not in seen: merged.append(n)
-                write_json(NODES_FILE, sort_nodes(merged[:5000]))
+                write_json(NODES_FILE, sort_nodes(merged[:300]))
             except Exception as e:
                 log("ERROR", "Fetch", str(e))
         threading.Thread(target=do, daemon=True).start()
@@ -2288,7 +2288,7 @@ def main():
                 merged.append(existing.get(c["id"], c)); seen.add(c["id"])
             for nid, n in existing.items():
                 if nid not in seen: merged.append(n)
-            write_json(NODES_FILE, sort_nodes(merged[:5000]))
+            write_json(NODES_FILE, sort_nodes(merged[:300]))
             to_test = [n for n in merged
                        if n.get("probe_status") == "not_checked"
                        and n.get("proto", "tcp") == "tcp"][:6]
@@ -2357,7 +2357,7 @@ def main():
                 merged.append(existing.get(c["id"], c)); seen.add(c["id"])
             for nid, n in existing.items():
                 if nid not in seen: merged.append(n)
-            write_json(NODES_FILE, sort_nodes(merged[:5000]))
+            write_json(NODES_FILE, sort_nodes(merged[:300]))
             gc.collect()
             to_test = [n for n in merged
                        if n.get("probe_status") == "not_checked"
