@@ -450,8 +450,29 @@ def run_openvpn(config_file: str, tun_dev: str, keep_alive: bool,
                 print(f"[OpenVPN/{tun_dev}] {line}", flush=True)
             lower = line.lower()
             if "initialization sequence completed" in lower:
-                ok = True
-                msg = f"连接成功，耗时 {int((time.time()-started)*1000)} ms"
+                # 等待最多5秒，确认没有紧随其后的 AUTH_FAILED
+                # （VPNGate 部分节点在隧道建立后才发送 AUTH_FAILED）
+                auth_ok = True
+                check_start = time.time()
+                while time.time() - check_start < 5:
+                    try:
+                        extra = lines.get(timeout=0.3)
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            break
+                        continue
+                    if extra is None:
+                        break
+                    if keep_alive:
+                        print(f"[OpenVPN/{tun_dev}] {extra}", flush=True)
+                    el = extra.lower()
+                    if "auth_failed" in el or "authentication failed" in el or "auth-failure" in el:
+                        msg = "AUTH_FAILED"
+                        auth_ok = False
+                        break
+                if auth_ok:
+                    ok  = True
+                    msg = f"连接成功，耗时 {int((time.time()-started)*1000)} ms"
                 break
             if "auth_failed" in lower or "authentication failed" in lower:
                 msg = "AUTH_FAILED"; break
